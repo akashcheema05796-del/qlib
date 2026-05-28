@@ -41,3 +41,9 @@ except ModuleNotFoundError:
     print("ModuleNotFoundError.  PyTorch models are skipped (optional: maybe installing pytorch can fix it).")
 
 all_model_classes = (CatBoostModel, DEnsembleModel, LGBModel, XGBModel, LinearModel) + pytorch_classes
+
+try:
+    from .hmm_regime import HMMRegimeModel
+except ImportError:
+    HMMRegimeModel = None
+    print("ImportError. HMMRegimeModel is skipped (optional: install hmmlearn with `pip install hmmlearn`).")

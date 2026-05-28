@@ -15,6 +15,7 @@ from .rule_strategy import (
 )
 
 from .cost_control import SoftTopkStrategy
+from .regime_gated import RegimeGatedStrategy, DEFAULT_REGIME_RISK_MAP
 
 __all__ = [
     "TopkDropoutStrategy",
@@ -24,4 +25,6 @@ __all__ = [
     "SBBStrategyBase",
     "SBBStrategyEMA",
     "SoftTopkStrategy",
+    "RegimeGatedStrategy",
+    "DEFAULT_REGIME_RISK_MAP",
 ]
