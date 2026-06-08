@@ -11,7 +11,7 @@ Key design choices (mirroring the v6 notebook):
   - BIC sweep over n_states in [2, max_states] on the training slice only
   - Multi-seed fitting (best log-likelihood kept)
   - Yeo-Johnson transform for bounded features before assuming Gaussian emissions
-  - State → regime name mapping based on train-set volatility/trend statistics
+  - States are raw integer indices — no semantic names are assigned
   - LightGBM transition classifier: P(regime changes within k bars)
   - Posterior entropy and top-probability signals for change-point detection
 """
@@ -31,55 +31,6 @@ from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
 
 logger = get_module_logger("HMMRegimeModel")
-
-
-# ---------------------------------------------------------------------------
-# Regime name assignment
-# ---------------------------------------------------------------------------
-
-def _assign_regime_names(state_stats: pd.DataFrame) -> Dict[int, str]:
-    """Map raw HMM state indices to human-readable regime names.
-
-    Sorting is based on realized volatility (rvol) and trend strength (roc)
-    computed on the training segment only, so the mapping is deterministic
-    across seeds and re-runs on the same training window.
-
-    The names used are intentionally general so they apply to equities, crypto,
-    or any other asset class.
-    """
-    df = state_stats.copy()
-    # Composite score: high vol → crisis/spike; high trend + low vol → trend
-    df["vol_rank"] = df["mean_rvol"].rank()
-    df["trend_rank"] = df["mean_roc_abs"].rank()
-    n = len(df)
-
-    name_map: Dict[int, str] = {}
-    for state, row in df.iterrows():
-        vr = row["vol_rank"]
-        tr = row["trend_rank"]
-        if vr >= n * 0.75:
-            name = "Vol_Spike"
-        elif vr <= n * 0.25 and tr >= n * 0.50:
-            name = "Low_Vol_Trend"
-        elif vr <= n * 0.25:
-            name = "Low_Vol_Range"
-        elif tr >= n * 0.75:
-            name = "High_Vol_Trend"
-        else:
-            name = "Choppy"
-        name_map[int(state)] = name
-
-    # Deduplicate names by appending state index
-    seen: Dict[str, int] = {}
-    deduped: Dict[int, str] = {}
-    for state, name in name_map.items():
-        if name in seen:
-            deduped[seen[name]] = f"{name}_{seen[name]}"
-            deduped[state] = f"{name}_{state}"
-        else:
-            seen[name] = state
-            deduped[state] = name
-    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +199,6 @@ class HMMRegimeModel(BaseModel):
         self.scaler: StandardScaler = None
         self.bounded_mask: np.ndarray = None
         self.feature_cols: List[str] = []
-        self.regime_map: Dict[int, str] = {}
         self.lgb_trans = None
 
     # ------------------------------------------------------------------
@@ -319,28 +269,6 @@ class HMMRegimeModel(BaseModel):
         self.hmm_model = best_fit[2]
         states_train = self.hmm_model.predict(X)
 
-        # --- State → regime name mapping (train stats only) ---
-        stats_rows = []
-        for s in range(best_k):
-            mask = states_train == s
-            if not mask.any():
-                continue
-            subset = x_daily.iloc[mask]
-            rvol_col = next((c for c in self.feature_cols if "RVOL" in c), None)
-            roc_col = next((c for c in self.feature_cols if "RET" in c), None)
-            stats_rows.append({
-                "state": s,
-                "mean_rvol": subset[rvol_col].mean() if rvol_col else 0.0,
-                "mean_roc_abs": subset[roc_col].abs().mean() if roc_col else 0.0,
-            })
-        if stats_rows:
-            state_stats = pd.DataFrame(stats_rows).set_index("state")
-            self.regime_map = _assign_regime_names(state_stats)
-        else:
-            self.regime_map = {s: f"State_{s}" for s in range(best_k)}
-
-        logger.info("Regime map: %s", self.regime_map)
-
         # --- Fit LightGBM transition classifier ---
         self._fit_transition_model(X, states_train)
 
@@ -382,17 +310,16 @@ class HMMRegimeModel(BaseModel):
     # ------------------------------------------------------------------
 
     def predict(self, dataset: DatasetH, segment: Union[str, slice] = "test") -> pd.DataFrame:
-        """Predict regime labels and associated signals for the given segment.
+        """Predict state labels and associated signals for the given segment.
 
         Returns a DataFrame indexed by (datetime, instrument) with columns:
 
         - ``state``      : integer HMM state index
-        - ``regime``     : human-readable regime name
         - ``entropy``    : posterior entropy (high = uncertain)
         - ``top_prob``   : highest posterior probability (high = certain)
         - ``trans_prob`` : P(regime changes in next k bars) from LightGBM
 
-        All instruments on a given date receive the same regime since the HMM
+        All instruments on a given date receive the same state since the HMM
         is fitted on the cross-sectional mean.
         """
         if self.hmm_model is None:
@@ -427,7 +354,6 @@ class HMMRegimeModel(BaseModel):
         daily_result = pd.DataFrame(
             {
                 "state": states,
-                "regime": [self.regime_map.get(int(s), f"State_{s}") for s in states],
                 "entropy": entropy,
                 "top_prob": top_prob,
                 "trans_prob": trans_prob,

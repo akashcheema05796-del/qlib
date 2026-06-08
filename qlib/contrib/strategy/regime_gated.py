@@ -1,23 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 """
-Regime-gated portfolio strategy for Qlib.
+State-gated portfolio strategy for Qlib.
 
 Wraps any weight-based signal strategy and modulates its position sizing
 using a pre-computed regime DataFrame produced by HMMRegimeModel.predict().
 
+States are raw HMM integer indices — no semantic names are assigned.
+Risk degrees per state are supplied by the user (typically derived from
+StateStrategySelector.state_risk_map() after empirical backtesting).
+
 Two gating mechanisms:
-  1. **Risk-degree scaling** – each regime has a configured risk multiplier so
-     "Vol_Spike" regimes automatically reduce overall exposure.
-  2. **Transition-probability gate** – when the LightGBM transition classifier
-     signals an imminent regime change (trans_prob > threshold), positions are
-     scaled down proportionally to (1 - trans_prob).
+  1. State-based risk degree — each HMM state has a configured multiplier.
+  2. Transition-probability gate — when the LightGBM transition classifier
+     signals an imminent state change (trans_prob > threshold), positions are
+     scaled down by (1 - trans_prob).
 """
 
 from __future__ import annotations
 
-import copy
-from typing import Dict, Optional, Union
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -27,65 +29,45 @@ from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
 
 logger = get_module_logger("RegimeGatedStrategy")
 
-# Default risk-degree per regime name.  Any unlisted regime falls back to
-# base_risk_degree.  Values are fractions of total portfolio value.
-DEFAULT_REGIME_RISK_MAP: Dict[str, float] = {
-    "Low_Vol_Trend": 0.95,
-    "Low_Vol_Range": 0.80,
-    "High_Vol_Trend": 0.70,
-    "Choppy": 0.50,
-    "Vol_Spike": 0.20,
-    # deduplicated variants
-    "Low_Vol_Trend_0": 0.95,
-    "Low_Vol_Range_0": 0.80,
-    "High_Vol_Trend_0": 0.70,
-    "Choppy_0": 0.50,
-    "Vol_Spike_0": 0.20,
-}
-
 
 class RegimeGatedStrategy(WeightStrategyBase):
-    """Portfolio strategy gated by a pre-computed market regime signal.
+    """Portfolio strategy gated by HMM state index.
 
     Parameters
     ----------
     regime_signal : pd.DataFrame
-        Output of ``HMMRegimeModel.predict()``. Must contain a ``regime``
-        column and optionally ``trans_prob``. Index should be a MultiIndex
-        of (datetime, instrument) or just datetime.
-    regime_risk_map : dict, optional
-        ``{regime_name: risk_degree}`` mapping.  Defaults to
-        ``DEFAULT_REGIME_RISK_MAP``.  Any regime not listed falls back to
-        ``base_risk_degree``.
+        Output of ``HMMRegimeModel.predict()``. Must contain a ``state``
+        column (int) and optionally ``trans_prob``. Index should be a
+        MultiIndex of (datetime, instrument) or just datetime.
+    state_risk_map : dict, optional
+        ``{state_int: risk_degree}`` mapping.  Any state not listed falls
+        back to ``base_risk_degree``.  Populate from
+        ``StateStrategySelector.state_risk_map()`` or set manually.
     trans_prob_thresh : float
         If ``trans_prob`` exceeds this threshold, positions are scaled by
-        ``(1 - trans_prob)`` to pre-empt a regime change.  Set to ``1.0``
+        ``(1 - trans_prob)`` to pre-empt a state change.  Set to ``1.0``
         to disable.
     base_risk_degree : float
-        Fallback risk degree used for regimes not present in
-        ``regime_risk_map``.
+        Fallback risk degree used for states not present in
+        ``state_risk_map``.
     signal : Signal-compatible
-        The base return-forecast signal (same as WeightStrategyBase).  Any
-        signal type accepted by ``create_signal_from()`` is valid.
-
-    Notes
-    -----
-    All other ``WeightStrategyBase`` / ``BaseSignalStrategy`` parameters
-    (``topk``, ``order_generator_cls_or_obj``, etc.) are forwarded via
-    ``**kwargs``.
+        The base return-forecast signal (same as WeightStrategyBase).
 
     Example
     -------
     ::
 
         regime_df = regime_model.predict(dataset, segment="test")
+        states = regime_df["state"].groupby(level="datetime").first()
+
+        selector = StateStrategySelector(metric="sharpe")
+        selector.fit(states, strategy_returns)
 
         strategy = RegimeGatedStrategy(
             signal=(alpha_model, dataset),
             regime_signal=regime_df,
-            regime_risk_map={"Low_Vol_Trend": 0.95, "Vol_Spike": 0.15},
+            state_risk_map=selector.state_risk_map(),
             trans_prob_thresh=0.40,
-            base_risk_degree=0.70,
         )
     """
 
@@ -93,7 +75,7 @@ class RegimeGatedStrategy(WeightStrategyBase):
         self,
         *,
         regime_signal: pd.DataFrame,
-        regime_risk_map: Optional[Dict[str, float]] = None,
+        state_risk_map: Optional[Dict[int, float]] = None,
         trans_prob_thresh: float = 0.40,
         base_risk_degree: float = 0.80,
         **kwargs,
@@ -101,53 +83,37 @@ class RegimeGatedStrategy(WeightStrategyBase):
         super().__init__(**kwargs)
 
         self._regime_signal = self._normalise_regime_signal(regime_signal)
-        self._regime_risk_map = dict(DEFAULT_REGIME_RISK_MAP)
-        if regime_risk_map:
-            self._regime_risk_map.update(regime_risk_map)
+        self._state_risk_map: Dict[int, float] = dict(state_risk_map or {})
         self._trans_prob_thresh = trans_prob_thresh
         self._base_risk_degree = base_risk_degree
 
-        # Cached lookup for the current bar
-        self._current_regime: Optional[str] = None
+        self._current_state: int = -1
         self._current_trans_prob: float = 0.0
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _normalise_regime_signal(df: pd.DataFrame) -> pd.DataFrame:
         """Accept either (datetime, instrument) MultiIndex or datetime-only index."""
         if isinstance(df.index, pd.MultiIndex):
-            # Group by date and take first row (all rows for a date share the regime)
             return df.groupby(level="datetime").first()
         return df
 
-    def _lookup_regime(self, trade_start_time) -> tuple[str, float]:
-        """Return (regime_name, trans_prob) for the given bar start time."""
+    def _lookup_state(self, trade_start_time) -> tuple[int, float]:
+        """Return (state_int, trans_prob) for the given bar start time."""
         try:
             row = self._regime_signal.loc[trade_start_time]
-            regime = str(row["regime"]) if "regime" in row.index else "Unknown"
+            state = int(row["state"]) if "state" in row.index else -1
             trans_prob = float(row["trans_prob"]) if "trans_prob" in row.index else 0.0
         except KeyError:
-            # No regime data for this date — fall back to safe defaults
-            regime = "Unknown"
+            state = -1
             trans_prob = 0.0
-        return regime, trans_prob
-
-    # ------------------------------------------------------------------
-    # WeightStrategyBase overrides
-    # ------------------------------------------------------------------
+        return state, trans_prob
 
     def get_risk_degree(self, trade_step=None) -> float:
-        """Return regime-adjusted risk degree for the current bar."""
-        base = self._regime_risk_map.get(self._current_regime, self._base_risk_degree)
-
-        # Additional scale-down when a transition is imminent
+        """Return state-adjusted risk degree for the current bar."""
+        base = self._state_risk_map.get(self._current_state, self._base_risk_degree)
         if self._current_trans_prob > self._trans_prob_thresh:
             scale = 1.0 - self._current_trans_prob
             return base * scale
-
         return base
 
     def generate_target_weight_position(
@@ -157,61 +123,48 @@ class RegimeGatedStrategy(WeightStrategyBase):
         trade_start_time,
         trade_end_time,
     ) -> dict:
-        """Compute target weights with regime-aware normalisation.
-
-        The base weights are derived from the alpha signal (score) and
-        then scaled uniformly by the regime risk degree.  Individual
-        weights are not zeroed — regime gating works through the overall
-        exposure level, not stock selection.
-        """
+        """Compute target weights scaled by state risk degree."""
         if isinstance(score, pd.DataFrame):
             score = score.iloc[:, 0]
 
-        # Rank-normalise so weights sum to risk_degree
         score = score.dropna()
         if score.empty:
             return {}
 
-        # Separate long and short (support long-only by clamping to positive)
         long_scores = score[score > 0]
         if long_scores.empty:
-            long_scores = score  # fall back to all if no positives
+            long_scores = score
 
         total = long_scores.abs().sum()
         if total == 0:
             return {}
 
-        weights = (long_scores / total).to_dict()
-        return weights
+        return (long_scores / total).to_dict()
 
     def generate_trade_decision(self, execute_result=None) -> TradeDecisionWO:
-        """Override to cache regime state before delegating to parent."""
+        """Cache state before delegating to parent."""
         trade_step = self.trade_calendar.get_trade_step()
         trade_start_time, _ = self.trade_calendar.get_step_time(trade_step)
 
-        self._current_regime, self._current_trans_prob = self._lookup_regime(trade_start_time)
+        self._current_state, self._current_trans_prob = self._lookup_state(trade_start_time)
 
         logger.debug(
-            "Date=%s  regime=%s  trans_prob=%.3f  risk_degree=%.3f",
+            "Date=%s  state=%d  trans_prob=%.3f  risk_degree=%.3f",
             trade_start_time,
-            self._current_regime,
+            self._current_state,
             self._current_trans_prob,
             self.get_risk_degree(trade_step),
         )
 
         return super().generate_trade_decision(execute_result)
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def regime_summary(self) -> pd.DataFrame:
-        """Return a summary of regime coverage from the loaded signal."""
-        if "regime" not in self._regime_signal.columns:
+    def state_summary(self) -> pd.DataFrame:
+        """Return count + configured risk degree for each state."""
+        if "state" not in self._regime_signal.columns:
             return pd.DataFrame()
-        counts = self._regime_signal["regime"].value_counts()
+        counts = self._regime_signal["state"].value_counts().sort_index()
         risk = counts.index.map(
-            lambda r: self._regime_risk_map.get(r, self._base_risk_degree)
+            lambda s: self._state_risk_map.get(int(s), self._base_risk_degree)
         )
         return pd.DataFrame(
             {"count": counts.values, "risk_degree": risk},

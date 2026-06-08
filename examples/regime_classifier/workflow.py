@@ -111,17 +111,14 @@ def predict_only(
     )
     model.fit(dataset)
 
-    print("\nRegime map:", model.regime_map)
-
     # --- Predict ---
     regime_df = model.predict(dataset, segment="test")
     print("\nSample regime predictions (first 10 dates):")
     print(regime_df.groupby(level="datetime").first().head(10))
 
-    # --- Regime distribution ---
-    dist = regime_df["regime"].value_counts()
-    print("\nRegime distribution (test set):")
-    print(dist.to_string())
+    # --- State distribution ---
+    print("\nState distribution (test set):")
+    print(regime_df["state"].value_counts().sort_index())
 
     return model, regime_df
 
@@ -198,14 +195,14 @@ def run(
     regime_model.fit(regime_dataset)
     regime_df = regime_model.predict(regime_dataset, segment="test")
 
-    print("\nRegime map:", regime_model.regime_map)
-    print("\nRegime distribution (test):")
-    print(regime_df["regime"].value_counts().to_string())
+    print("\nState distribution (test):")
+    print(regime_df["state"].value_counts().sort_index())
 
     # ---- Regime-gated strategy ----
     regime_strategy = RegimeGatedStrategy(
         signal=(alpha_model, alpha_dataset),
         regime_signal=regime_df,
+        state_risk_map={},
         trans_prob_thresh=0.40,
         base_risk_degree=0.80,
     )

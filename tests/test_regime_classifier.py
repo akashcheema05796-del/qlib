@@ -79,7 +79,6 @@ class _MockDataset:
     def prepare(self, segment, col_set=None, data_key=None):
         df = self._data[segment]
         if col_set == ["feature"] or col_set == "feature":
-            # Wrap in MultiIndex columns to match DataHandlerLP output
             return pd.DataFrame(
                 df.values,
                 index=df.index,
@@ -141,22 +140,23 @@ class TestHMMRegimeModel(unittest.TestCase):
     def test_fit_sets_hmm_model(self):
         self.assertIsNotNone(self.model.hmm_model)
 
-    def test_fit_builds_regime_map(self):
-        self.assertIsInstance(self.model.regime_map, dict)
-        self.assertGreater(len(self.model.regime_map), 0)
-
     def test_predict_returns_dataframe(self):
         result = self.model.predict(self.dataset, segment="test")
         self.assertIsInstance(result, pd.DataFrame)
 
     def test_predict_has_required_columns(self):
         result = self.model.predict(self.dataset, segment="test")
-        for col in ("state", "regime", "entropy", "top_prob", "trans_prob"):
+        for col in ("state", "entropy", "top_prob", "trans_prob"):
             self.assertIn(col, result.columns, f"Missing column: {col}")
+        self.assertNotIn("regime", result.columns, "regime column should not be present")
+
+    def test_predict_state_is_integer(self):
+        result = self.model.predict(self.dataset, segment="test")
+        self.assertTrue(pd.api.types.is_integer_dtype(result["state"]) or
+                        result["state"].apply(lambda x: isinstance(x, (int, np.integer))).all())
 
     def test_predict_index_matches_input(self):
         result = self.model.predict(self.dataset, segment="test")
-        # Every row in the test DataFrame should have a regime
         test_raw = self.dataset._data["test"]
         self.assertEqual(len(result), len(test_raw))
 
@@ -177,53 +177,129 @@ class TestHMMRegimeModel(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# StateStrategySelector
+# ---------------------------------------------------------------------------
+
+class TestStateStrategySelector(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(0)
+        dates = pd.date_range("2021-01-01", periods=200, freq="B")
+        # Simulated states: 0, 1, 2 cycling
+        cls.states = pd.Series(
+            np.tile([0, 1, 2], 200)[:200],
+            index=dates,
+            name="state",
+        )
+        # Simulated strategy returns (state 0 favours IronCondor, state 1 favours Straddle)
+        ic_ret = pd.Series(rng.normal(0.002, 0.01, 200), index=dates)  # generally good
+        st_ret = pd.Series(rng.normal(-0.001, 0.02, 200), index=dates)  # noisy
+        cls.strategy_returns = {
+            "IronCondor": ic_ret,
+            "Straddle": st_ret,
+            "Flat": pd.Series(0.0, index=dates),
+        }
+
+    def test_fit_runs(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector(metric="sharpe", min_obs=10)
+        sel.fit(self.states, self.strategy_returns)
+        self.assertIsNotNone(sel._state_strategy_map)
+
+    def test_state_strategy_map_covers_all_states(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector(metric="sharpe", min_obs=10)
+        sel.fit(self.states, self.strategy_returns)
+        mapping = sel.state_strategy_map
+        for s in [0, 1, 2]:
+            self.assertIn(s, mapping)
+
+    def test_state_strategy_map_values_are_known_strategies(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector(metric="sharpe", min_obs=10)
+        sel.fit(self.states, self.strategy_returns)
+        known = set(self.strategy_returns.keys())
+        for strat in sel.state_strategy_map.values():
+            self.assertIn(strat, known)
+
+    def test_report_has_expected_columns(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector(metric="sharpe", min_obs=10)
+        sel.fit(self.states, self.strategy_returns)
+        report = sel.report()
+        for col in ("state", "strategy", "count", "mean", "sharpe", "score"):
+            self.assertIn(col, report.columns)
+
+    def test_state_risk_map_in_range(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector(metric="sharpe", min_obs=10)
+        sel.fit(self.states, self.strategy_returns)
+        risk_map = sel.state_risk_map(base=0.80, floor=0.10)
+        for state, risk in risk_map.items():
+            self.assertGreaterEqual(risk, 0.10 - 1e-9)
+            self.assertLessEqual(risk, 0.80 + 1e-9)
+
+    def test_fallback_for_insufficient_obs(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector(metric="sharpe", min_obs=1000)  # very high threshold
+        sel.fit(self.states, self.strategy_returns, fallback="Flat")
+        # All states should fall back since no state has 1000 obs
+        for strat in sel.state_strategy_map.values():
+            self.assertEqual(strat, "Flat")
+
+    def test_invalid_metric_raises(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        with self.assertRaises(ValueError):
+            StateStrategySelector(metric="bad_metric")
+
+
+# ---------------------------------------------------------------------------
 # Regime-gated strategy (unit-level, no live backtest)
 # ---------------------------------------------------------------------------
 
 class TestRegimeGatedStrategy(unittest.TestCase):
 
-    def _make_regime_df(self, dates: pd.DatetimeIndex) -> pd.DataFrame:
-        regimes = ["Low_Vol_Trend", "Choppy", "Vol_Spike"]
+    def _make_state_df(self, dates: pd.DatetimeIndex) -> pd.DataFrame:
+        """Build a minimal regime_df with state (int) and trans_prob columns."""
         return pd.DataFrame({
-            "state": range(len(dates)),
-            "regime": [regimes[i % 3] for i in range(len(dates))],
+            "state": [i % 3 for i in range(len(dates))],
             "entropy": np.random.uniform(0, 1, len(dates)),
             "top_prob": np.random.uniform(0.5, 1.0, len(dates)),
             "trans_prob": np.random.uniform(0, 0.6, len(dates)),
         }, index=dates)
 
-    def test_risk_degree_varies_by_regime(self):
-        from qlib.contrib.strategy.regime_gated import RegimeGatedStrategy, DEFAULT_REGIME_RISK_MAP
+    def test_risk_degree_varies_by_state(self):
+        from qlib.contrib.strategy.regime_gated import RegimeGatedStrategy
 
         dates = pd.date_range("2021-01-01", periods=10, freq="B")
-        regime_df = self._make_regime_df(dates)
+        state_df = self._make_state_df(dates)
 
-        # Manually set current regime and check risk degree
         strat = RegimeGatedStrategy.__new__(RegimeGatedStrategy)
-        strat._regime_risk_map = dict(DEFAULT_REGIME_RISK_MAP)
+        strat._state_risk_map = {0: 0.90, 1: 0.50, 2: 0.20}
         strat._base_risk_degree = 0.80
         strat._trans_prob_thresh = 0.40
-        strat._regime_signal = regime_df
+        strat._regime_signal = state_df
 
-        strat._current_regime = "Low_Vol_Trend"
+        strat._current_state = 0
         strat._current_trans_prob = 0.1
-        risk_trend = strat.get_risk_degree()
+        risk_high = strat.get_risk_degree()
 
-        strat._current_regime = "Vol_Spike"
+        strat._current_state = 2
         strat._current_trans_prob = 0.1
-        risk_spike = strat.get_risk_degree()
+        risk_low = strat.get_risk_degree()
 
-        self.assertGreater(risk_trend, risk_spike)
+        self.assertGreater(risk_high, risk_low)
 
     def test_high_trans_prob_reduces_risk(self):
         from qlib.contrib.strategy.regime_gated import RegimeGatedStrategy
 
         strat = RegimeGatedStrategy.__new__(RegimeGatedStrategy)
-        strat._regime_risk_map = {}
+        strat._state_risk_map = {}
         strat._base_risk_degree = 0.90
         strat._trans_prob_thresh = 0.40
 
-        strat._current_regime = "Unknown"
+        strat._current_state = 0
         strat._current_trans_prob = 0.0
         risk_low = strat.get_risk_degree()
 
@@ -232,21 +308,32 @@ class TestRegimeGatedStrategy(unittest.TestCase):
 
         self.assertGreater(risk_low, risk_high)
 
-    def test_regime_summary(self):
+    def test_state_summary(self):
         from qlib.contrib.strategy.regime_gated import RegimeGatedStrategy
 
         dates = pd.date_range("2021-01-01", periods=30, freq="B")
-        regime_df = self._make_regime_df(dates)
+        state_df = self._make_state_df(dates)
 
         strat = RegimeGatedStrategy.__new__(RegimeGatedStrategy)
-        strat._regime_signal = RegimeGatedStrategy._normalise_regime_signal(regime_df)
-        from qlib.contrib.strategy.regime_gated import DEFAULT_REGIME_RISK_MAP
-        strat._regime_risk_map = dict(DEFAULT_REGIME_RISK_MAP)
+        strat._regime_signal = RegimeGatedStrategy._normalise_regime_signal(state_df)
+        strat._state_risk_map = {0: 0.90, 1: 0.50, 2: 0.20}
         strat._base_risk_degree = 0.80
 
-        summary = strat.regime_summary()
+        summary = strat.state_summary()
         self.assertIn("count", summary.columns)
         self.assertIn("risk_degree", summary.columns)
+
+    def test_unknown_state_uses_base_risk(self):
+        from qlib.contrib.strategy.regime_gated import RegimeGatedStrategy
+
+        strat = RegimeGatedStrategy.__new__(RegimeGatedStrategy)
+        strat._state_risk_map = {0: 0.90}
+        strat._base_risk_degree = 0.60
+        strat._trans_prob_thresh = 1.0
+
+        strat._current_state = -1  # unknown
+        strat._current_trans_prob = 0.0
+        self.assertAlmostEqual(strat.get_risk_degree(), 0.60)
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +367,56 @@ class TestEndToEnd(unittest.TestCase):
         result = model.predict(dataset, segment="test")
 
         self.assertEqual(len(result), len(test_df))
-        self.assertFalse(result["regime"].isna().any())
-        self.assertTrue(result["state"].isin(list(model.regime_map.keys())).all())
+        self.assertFalse(result["state"].isna().any())
+        self.assertNotIn("regime", result.columns)
+        # All predicted states must be valid HMM state indices
+        valid_states = set(range(model.hmm_model.n_components))
+        self.assertTrue(result["state"].isin(valid_states).all())
+
+    def test_state_strategy_selector_end_to_end(self):
+        try:
+            import hmmlearn  # noqa
+        except ImportError:
+            self.skipTest("hmmlearn not installed")
+
+        from qlib.contrib.model.hmm_regime import HMMRegimeModel
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+
+        ohlcv = _make_ohlcv(n_dates=300)
+        feat = _make_feature_df(ohlcv)
+
+        all_dates = feat.index.get_level_values("datetime").unique().sort_values()
+        split = int(len(all_dates) * 0.8)
+        train_dates = all_dates[:split]
+        test_dates = all_dates[split:]
+
+        train_df = feat[feat.index.get_level_values("datetime").isin(train_dates)]
+        test_df = feat[feat.index.get_level_values("datetime").isin(test_dates)]
+        dataset = _MockDataset(train_df, test_df)
+
+        model = HMMRegimeModel(n_states=2, n_seeds=2, n_iter=50)
+        model.fit(dataset)
+        regime_df = model.predict(dataset, segment="train")
+
+        # Get per-date states
+        states = regime_df["state"].groupby(level="datetime").first()
+
+        # Synthetic strategy returns (same dates as training states)
+        rng = np.random.default_rng(99)
+        strategy_returns = {
+            "IronCondor": pd.Series(rng.normal(0.001, 0.01, len(states)), index=states.index),
+            "Straddle": pd.Series(rng.normal(0.0, 0.02, len(states)), index=states.index),
+            "Flat": pd.Series(0.0, index=states.index),
+        }
+
+        sel = StateStrategySelector(metric="sharpe", min_obs=5)
+        sel.fit(states, strategy_returns, fallback="Flat")
+
+        mapping = sel.state_strategy_map
+        self.assertEqual(set(mapping.keys()), set(range(model.hmm_model.n_components)))
+
+        risk_map = sel.state_risk_map()
+        self.assertEqual(set(risk_map.keys()), set(mapping.keys()))
 
 
 if __name__ == "__main__":
