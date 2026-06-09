@@ -99,7 +99,9 @@ def _regime_feature_config():
 class RegimeDataHandler(DataHandlerLP):
     """Data handler for market regime classification.
 
-    Provides 18 features derived from OHLCV data:
+    Provides 18 features derived from OHLCV data — compatible with any
+    standard Qlib data source including equity and crypto.
+
     - Log returns at 4 horizons (1, 5, 10, 20 bars)
     - Realized volatility at 3 horizons (5, 10, 20 bars)
     - Garman-Klass volatility estimator
@@ -113,22 +115,32 @@ class RegimeDataHandler(DataHandlerLP):
     Parameters
     ----------
     instruments : str or list
-        Qlib instrument pool, e.g. "csi500" or ["SH600000", ...].
+        Qlib instrument pool.  Must be specified explicitly — no default.
+        Equity example: ``"csi500"``.
+        Crypto example: ``["btcusdt", "ethusdt"]`` (Binance collector output).
     start_time : str
         Start of the data window.
     end_time : str
         End of the data window.
     freq : str
-        Bar frequency, e.g. "day" or "1min".
+        Bar frequency.  Use ``"day"`` for daily data (both equity and crypto).
     fit_start_time : str
         Start of the period used to fit processors (normalisation).
     fit_end_time : str
         End of the period used to fit processors.
+
+    Notes
+    -----
+    For crypto: use the Binance collector at
+    ``scripts/data_collector/crypto_binance/collector.py`` to download data,
+    then initialise Qlib with ``provider_uri`` pointing at the output directory.
+    Crypto trades 24/7 — ``StateStrategySelector`` defaults to
+    ``annualization=365``; do not override to 252.
     """
 
     def __init__(
         self,
-        instruments="csi500",
+        instruments,
         start_time=None,
         end_time=None,
         freq="day",

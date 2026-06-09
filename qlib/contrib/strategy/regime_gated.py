@@ -104,6 +104,10 @@ class RegimeGatedStrategy(WeightStrategyBase):
             state = int(row["state"]) if "state" in row.index else -1
             trans_prob = float(row["trans_prob"]) if "trans_prob" in row.index else 0.0
         except KeyError:
+            logger.warning(
+                "Date %s not found in regime signal; falling back to base_risk_degree.",
+                trade_start_time,
+            )
             state = -1
             trans_prob = 0.0
         return state, trans_prob

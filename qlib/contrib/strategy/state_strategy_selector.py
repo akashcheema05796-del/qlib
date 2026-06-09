@@ -68,7 +68,7 @@ class StateStrategySelector:
         self,
         metric: str = "sharpe",
         min_obs: int = 20,
-        annualization: int = 252,
+        annualization: int = 365,
     ):
         if metric not in _VALID_METRICS:
             raise ValueError(f"metric must be one of {_VALID_METRICS}, got '{metric}'")
@@ -104,6 +104,8 @@ class StateStrategySelector:
             Strategy used when a state has < ``min_obs`` valid observations.
             If not already in ``strategy_returns``, it is added as zeros.
         """
+        if not strategy_returns:
+            raise ValueError("strategy_returns must not be empty.")
         strategy_returns = dict(strategy_returns)
         if fallback not in strategy_returns:
             strategy_returns[fallback] = pd.Series(0.0, index=states.index)

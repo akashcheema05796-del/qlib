@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
+from scipy.special import logsumexp
 from sklearn.preprocessing import PowerTransformer, StandardScaler
 
 from ...log import get_module_logger
@@ -94,6 +95,35 @@ def _posterior_entropy(posterior: np.ndarray) -> np.ndarray:
     """H(t) = -sum_k p_k * log(p_k). Low when model is certain about state."""
     p = np.clip(posterior, 1e-12, 1.0)
     return np.maximum(0.0, -(p * np.log(p)).sum(axis=1))
+
+
+def _forward_filtered(model, X: np.ndarray) -> np.ndarray:
+    """Compute causal (forward-filtered) state probabilities.
+
+    At each t, P(s_t | o_1, ..., o_t) uses only past and current observations —
+    no future data — eliminating look-ahead bias in backtesting.
+
+    Returns
+    -------
+    filtered : np.ndarray, shape (T, n_components)
+        P(s_t | o_1:t) for each time step.
+    """
+    T = len(X)
+    K = model.n_components
+    log_emit = model._compute_log_likelihood(X)  # (T, K)
+    log_transmat = np.log(np.clip(model.transmat_, 1e-300, 1.0))  # (K, K)
+
+    log_alpha = np.empty((T, K))
+    log_alpha[0] = np.log(np.clip(model.startprob_, 1e-300, 1.0)) + log_emit[0]
+
+    for t in range(1, T):
+        # log_alpha[t, j] = log_emit[t, j] + logsumexp_i(log_alpha[t-1, i] + log_transmat[i, j])
+        log_alpha[t] = log_emit[t] + logsumexp(log_alpha[t - 1, :, None] + log_transmat, axis=0)
+
+    # Normalise rows to get probabilities
+    log_norm = logsumexp(log_alpha, axis=1, keepdims=True)
+    filtered = np.exp(log_alpha - log_norm)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +339,28 @@ class HMMRegimeModel(BaseModel):
     # predict
     # ------------------------------------------------------------------
 
-    def predict(self, dataset: DatasetH, segment: Union[str, slice] = "test") -> pd.DataFrame:
+    def predict(
+        self,
+        dataset: DatasetH,
+        segment: Union[str, slice] = "test",
+        decode: str = "filtered",
+    ) -> pd.DataFrame:
         """Predict state labels and associated signals for the given segment.
+
+        Parameters
+        ----------
+        dataset : DatasetH
+        segment : str or slice
+        decode : {"filtered", "viterbi", "smooth"}
+            State decoding algorithm.
+
+            - ``"filtered"`` *(default, recommended for backtesting)* — uses only
+              observations up to time t (forward algorithm). No look-ahead bias.
+            - ``"viterbi"`` — globally optimal path via Viterbi; uses the entire
+              sequence, introducing look-ahead bias. Suitable for post-hoc analysis.
+            - ``"smooth"`` — forward-backward smoothed posterior; also uses future
+              data. Gives smoother state sequences but is **not** suitable for live
+              or backtest use.
 
         Returns a DataFrame indexed by (datetime, instrument) with columns:
 
@@ -318,12 +368,11 @@ class HMMRegimeModel(BaseModel):
         - ``entropy``    : posterior entropy (high = uncertain)
         - ``top_prob``   : highest posterior probability (high = certain)
         - ``trans_prob`` : P(regime changes in next k bars) from LightGBM
-
-        All instruments on a given date receive the same state since the HMM
-        is fitted on the cross-sectional mean.
         """
         if self.hmm_model is None:
             raise ValueError("Model is not fitted yet. Call fit() first.")
+        if decode not in ("filtered", "viterbi", "smooth"):
+            raise ValueError(f"decode must be 'filtered', 'viterbi', or 'smooth'; got '{decode}'")
 
         df = dataset.prepare(segment, col_set=["feature"], data_key=DataHandlerLP.DK_I)
         x_daily = self._aggregate_features(df).dropna()
@@ -335,9 +384,21 @@ class HMMRegimeModel(BaseModel):
         X_raw = x_daily[self.feature_cols].values.astype(np.float64)
         X = self._transform(X_raw)
 
-        # Viterbi states
-        states = self.hmm_model.predict(X)
-        posterior = self.hmm_model.predict_proba(X)
+        if decode == "filtered":
+            posterior = _forward_filtered(self.hmm_model, X)
+            states = np.argmax(posterior, axis=1)
+        elif decode == "viterbi":
+            states = self.hmm_model.predict(X)
+            posterior = self.hmm_model.predict_proba(X)
+        else:  # smooth
+            posterior = self.hmm_model.predict_proba(X)
+            states = np.argmax(posterior, axis=1)
+
+        if decode == "viterbi":
+            logger.debug("Using Viterbi decoding — look-ahead bias present; suitable for post-hoc analysis only.")
+        elif decode == "smooth":
+            logger.debug("Using smoothed decoding — look-ahead bias present; suitable for post-hoc analysis only.")
+
         entropy = _posterior_entropy(posterior)
         top_prob = posterior.max(axis=1)
 

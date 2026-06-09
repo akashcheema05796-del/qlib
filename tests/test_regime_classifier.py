@@ -175,6 +175,28 @@ class TestHMMRegimeModel(unittest.TestCase):
         self.assertIsNotNone(model_auto.hmm_model)
         self.assertGreaterEqual(model_auto.hmm_model.n_components, 2)
 
+    def test_predict_decode_filtered_no_lookahead(self):
+        """filtered decode is the default and produces valid output."""
+        result = self.model.predict(self.dataset, segment="test", decode="filtered")
+        self.assertIsInstance(result, pd.DataFrame)
+        for col in ("state", "entropy", "top_prob", "trans_prob"):
+            self.assertIn(col, result.columns)
+        self.assertTrue((result["top_prob"] >= 0).all())
+        self.assertTrue((result["top_prob"] <= 1).all())
+
+    def test_predict_decode_viterbi(self):
+        result = self.model.predict(self.dataset, segment="test", decode="viterbi")
+        self.assertIn("state", result.columns)
+
+    def test_predict_decode_smooth(self):
+        result = self.model.predict(self.dataset, segment="test", decode="smooth")
+        self.assertIn("state", result.columns)
+
+    def test_predict_invalid_decode_raises(self):
+        from qlib.contrib.model.hmm_regime import HMMRegimeModel
+        with self.assertRaises(ValueError):
+            self.model.predict(self.dataset, segment="test", decode="bad_mode")
+
 
 # ---------------------------------------------------------------------------
 # StateStrategySelector
@@ -252,6 +274,17 @@ class TestStateStrategySelector(unittest.TestCase):
         from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
         with self.assertRaises(ValueError):
             StateStrategySelector(metric="bad_metric")
+
+    def test_annualization_default_is_365(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector()
+        self.assertEqual(sel.annualization, 365)
+
+    def test_empty_strategy_returns_raises(self):
+        from qlib.contrib.strategy.state_strategy_selector import StateStrategySelector
+        sel = StateStrategySelector()
+        with self.assertRaises(ValueError, msg="empty strategy_returns should raise ValueError"):
+            sel.fit(self.states, {})
 
 
 # ---------------------------------------------------------------------------
