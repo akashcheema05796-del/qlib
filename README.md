@@ -569,6 +569,136 @@ Most general-purpose databases take too much time to load data. After looking in
 Such overheads greatly slow down the data loading process.
 Qlib data are stored in a compact format, which is efficient to be combined into arrays for scientific computation.
 
+# Regime-Conditioned Crypto Derivatives
+
+This extension adds an HMM-based market regime classifier and a full walk-forward backtesting workflow for crypto derivatives strategies (perpetual futures + weekly options).
+
+## System Overview
+
+```
+OHLCV + Funding + DVOL
+        │
+        ▼
+RegimeDataHandler  ── vol-relative (percentile-rank) features
+        │
+        ▼
+HMMRegimeModel     ── GaussianHMM, BIC sweep, multi-seed, hysteresis filter
+        │
+        ▼
+HMMLabelAligner    ── Hungarian assignment to prevent label switching on refit
+        │
+        ▼
+StateStrategySelector ── min_obs / margin / bootstrap guards → state→strategy map
+        │
+        ▼
+RegimeWalkForward  ── W1 fit / W2 select / W3 OOS rolling protocol
+        │
+        ▼
+WalkForwardResult  ── OOS PnL, Sharpe, Calmar, leakage test, trial ledger
+```
+
+**Key design decisions:**
+
+| Decision | Rationale |
+|---|---|
+| `K=3` states fixed | Bull / Bear / High-Vol; BIC sweep available as `n_states="auto"` |
+| Annualisation = 365 | Crypto trades 24/7 |
+| `min_obs=80` per state | SE of Sharpe ≈ ±2.1; 20 obs (old default) gave SE ±4.3 |
+| Percentile-rank vol features | BTC vol compressed 100%→45% (2018→2024); raw levels are non-stationary |
+| Forward-filtered decode | Causal — no look-ahead bias |
+| Hysteresis gate (prob ≥ 0.70, 3 bars) | Prevents fee bleed from state chatter |
+| Black-76 option pricing | Forward model; Deribit DVOL as IV for realistic PnL |
+| Costs charged at strategy switches only | Perpetual positions are held open, not rolled daily |
+| Vol-targeting (40% ann., 2× cap) | Normalises risk across heterogeneous strategies |
+| VRP-gated short vol | Short straddles only fire when implied > realised vol |
+| Newey-West HAC Sharpe t-stat | Daily OOS PnL is serially correlated; naive t-stat overstates significance |
+| Single-asset HMM (`hmm_instrument`) | Fit on BTC features alone rather than a BTC/ETH blend |
+
+## Installation
+
+```bash
+pip install -r requirements/regime_classifier.txt
+```
+
+The regime classifier requires `hmmlearn>=0.3.0` and `scipy>=1.11.0` in addition to
+the standard Qlib dependencies.
+
+## Quick Start
+
+### 1. Download data
+
+```bash
+python examples/regime_classifier/crypto_workflow.py download_data
+```
+
+This fetches Binance OHLCV (from 2018), Binance perpetual funding rates
+(from 2019-09), and Deribit DVOL (from 2021-03) in one step.
+
+### 2. Validate the downloaded data
+
+```bash
+python examples/regime_classifier/crypto_workflow.py validate_data
+```
+
+Checks for calendar gaps, stale/zero prices, funding NaN rates, and
+out-of-range DVOL values before any modelling begins.
+
+### 3. Run the full walk-forward backtest
+
+```bash
+python examples/regime_classifier/crypto_workflow.py run
+```
+
+Rolls W1=18mo fit / W2=6mo select / W3=3mo OOS quarterly across the research
+period and reports aggregate OOS Sharpe (HAC-corrected t-stat), Calmar, max
+drawdown, and hit rate against buy-and-hold / funding-carry / vol-target
+baselines.
+
+### 4. Run on the sealed holdout (2024-Q4 onward — only once!)
+
+```bash
+python examples/regime_classifier/crypto_workflow.py holdout
+```
+
+## Strategy Library
+
+| Strategy | Instrument | Active period |
+|---|---|---|
+| `LongPerp` / `ShortPerp` | Perpetual futures | 2019-09 → |
+| `FundingCarry` | Delta-hedged perp | 2019-09 → |
+| `ShortStraddle` / `IronCondor` / `BullPutSpread` | Weekly options (Black-76, DVOL IV) | 2021-07 → |
+| `VRPShortStraddle` | Short straddle gated on Variance Risk Premium > 0 | 2021-07 → |
+| `Flat` | No position | always |
+
+## Module Reference
+
+| Module | Description |
+|---|---|
+| `qlib/contrib/data/handler_regime.py` | `RegimeDataHandler` — 18 stationary OHLCV features |
+| `qlib/contrib/model/hmm_regime.py` | `HMMRegimeModel` — GaussianHMM with BIC, hysteresis |
+| `qlib/contrib/model/hmm_label_aligner.py` | `HMMLabelAligner` — Hungarian alignment across refits |
+| `qlib/contrib/strategy/crypto_payoff.py` | `PerpSimulator`, `OptionSimulator`, `compute_vrp` — daily PnL series |
+| `qlib/contrib/strategy/state_strategy_selector.py` | `StateStrategySelector` — hardened regime→strategy mapping |
+| `qlib/contrib/strategy/regime_gated.py` | `RegimeGatedStrategy` — runtime risk-degree gating |
+| `qlib/contrib/workflow/regime_walkforward.py` | `RegimeWalkForward` — W1/W2/W3 rolling protocol, vol-targeting, HAC stats |
+| `examples/regime_classifier/crypto_workflow.py` | End-to-end CLI (`download_data` / `validate_data` / `predict_only` / `run` / `holdout`) |
+| `scripts/data_collector/crypto_binance/` | Binance OHLCV + funding collectors |
+| `scripts/data_collector/crypto_deribit/` | Deribit DVOL collector |
+| `tests/test_regime_classifier.py` | 106 unit + integration tests |
+
+## Statistical Safeguards
+
+- **Leakage check** — `leakage_check()` re-runs the protocol with features shifted +1 day; if the future-injected run wins ≥75% of windows, a `LeakageWarning` is raised.
+- **Multiple-testing ledger** — every `run()` appends to `~/.qlib/regime_trials.csv` and reports a Bonferroni-corrected p-value across all trials.
+- **Sealed holdout** — the final 2024-Q4+ slice is evaluated exactly once, after all hyperparameters are frozen.
+
+## Project Plan
+
+See [`docs/REGIME_PROJECT_PLAN.md`](docs/REGIME_PROJECT_PLAN.md) for the full
+9-phase implementation plan, statistical validation protocol, and risk register.
+
+---
+
 # Related Reports
 - [Guide To Qlib: Microsoft’s AI Investment Platform](https://analyticsindiamag.com/qlib/)
 - [微软也搞AI量化平台？还是开源的！](https://mp.weixin.qq.com/s/47bP5YwxfTp2uTHjUBzJQQ)
