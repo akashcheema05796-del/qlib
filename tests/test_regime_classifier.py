@@ -235,6 +235,29 @@ class TestHMMRegimeModel(unittest.TestCase):
 # BIC formula correctness
 # ---------------------------------------------------------------------------
 
+class TestBoundedMask(unittest.TestCase):
+    """Yeo-Johnson should NOT be applied to percentile-rank features."""
+
+    def test_rank_features_excluded_from_mask(self):
+        from qlib.contrib.model.hmm_regime import _bounded_mask
+        cols = ["RVOL5_RANK", "GK_VOL_RANK", "ATR_RANK", "BB_WIDTH_RANK",
+                "BB_POS", "SKEW20", "KURT20"]
+        mask = _bounded_mask(cols)
+        for i, col in enumerate(cols):
+            if col.endswith("_RANK"):
+                self.assertFalse(mask[i], f"_RANK feature '{col}' should NOT be power-transformed")
+
+    def test_non_rank_bounded_features_included(self):
+        from qlib.contrib.model.hmm_regime import _bounded_mask
+        # Old-style raw features without _RANK suffix should still be transformed
+        cols = ["RVOL5", "GK_VOL", "ATR_NORM", "BB_WIDTH", "RET1"]
+        mask = _bounded_mask(cols)
+        # RVOL5, GK_VOL, ATR_NORM, BB_WIDTH all contain fragment matches
+        self.assertTrue(mask[0])  # RVOL5
+        self.assertTrue(mask[1])  # GK_VOL
+        self.assertFalse(mask[4])  # RET1 — no fragment match
+
+
 class TestBICFormula(unittest.TestCase):
 
     def test_bic_does_not_double_count_n(self):
@@ -679,34 +702,32 @@ class TestPerpSimulator(unittest.TestCase):
         return prices, funding_daily
 
     def test_long_perp_formula(self):
-        """PnL_long = (P[t+1]/P[t]-1) - funding[t] - 2*(fee+slip)."""
+        """PnL_long = (P[t+1]/P[t]-1) - funding[t]  (no daily round-trip cost)."""
         from qlib.contrib.strategy.crypto_payoff import PerpSimulator
         sim = PerpSimulator(taker_fee=0.0005, slippage=0.00005)
         prices, funding = self._make_price_funding(n=10)
 
         pnl = sim.long_perp(prices, funding)
 
-        cost = 2.0 * (0.0005 + 0.00005)
-        # Verify bar 0 manually (bar -1 is NaN)
-        expected_t0 = prices.iloc[1] / prices.iloc[0] - 1.0 - funding.iloc[0] - cost
+        # No daily transaction cost — perpetual held open, costs at switch time only
+        expected_t0 = prices.iloc[1] / prices.iloc[0] - 1.0 - funding.iloc[0]
         self.assertAlmostEqual(pnl.iloc[0], expected_t0, places=10)
         # Last element should be NaN (no t+1 price)
         self.assertTrue(np.isnan(pnl.iloc[-1]))
 
     def test_short_perp_formula(self):
-        """PnL_short = -(P[t+1]/P[t]-1) + funding[t] - 2*(fee+slip)."""
+        """PnL_short = -(P[t+1]/P[t]-1) + funding[t]  (no daily round-trip cost)."""
         from qlib.contrib.strategy.crypto_payoff import PerpSimulator
         sim = PerpSimulator(taker_fee=0.0005, slippage=0.00005)
         prices, funding = self._make_price_funding(n=10)
 
         pnl = sim.short_perp(prices, funding)
 
-        cost = 2.0 * (0.0005 + 0.00005)
-        expected_t0 = -(prices.iloc[1] / prices.iloc[0] - 1.0) + funding.iloc[0] - cost
+        expected_t0 = -(prices.iloc[1] / prices.iloc[0] - 1.0) + funding.iloc[0]
         self.assertAlmostEqual(pnl.iloc[0], expected_t0, places=10)
 
-    def test_long_short_sum_is_negative_twice_cost(self):
-        """Long + Short = -2 * round_trip_cost per bar (funding cancels)."""
+    def test_long_short_sum_is_zero(self):
+        """Long + Short = 0 per bar (price return and funding both cancel exactly)."""
         from qlib.contrib.strategy.crypto_payoff import PerpSimulator
         sim = PerpSimulator(taker_fee=0.0005, slippage=0.00005)
         prices, funding = self._make_price_funding(n=50)
@@ -715,8 +736,7 @@ class TestPerpSimulator(unittest.TestCase):
         short_pnl = sim.short_perp(prices, funding).dropna()
 
         combined = long_pnl + short_pnl
-        expected = -2.0 * sim._round_trip_cost()
-        np.testing.assert_allclose(combined.values, expected, atol=1e-12)
+        np.testing.assert_allclose(combined.values, 0.0, atol=1e-12)
 
     def test_funding_carry_flat_when_below_threshold(self):
         """Days with abs(annualised funding) < min_funding_ann should return 0."""
@@ -886,6 +906,55 @@ class TestOptionSimulator(unittest.TestCase):
 # RegimeWalkForward helpers
 # ---------------------------------------------------------------------------
 
+class TestComputeVRP(unittest.TestCase):
+
+    def test_vrp_is_series(self):
+        from qlib.contrib.strategy.crypto_payoff import compute_vrp
+        rng = np.random.default_rng(1)
+        dates = pd.date_range("2022-01-01", periods=60, freq="D")
+        prices = pd.Series(40_000.0 * np.exp(np.cumsum(rng.normal(0, 0.02, 60))), index=dates)
+        dvol = pd.Series(rng.uniform(60.0, 100.0, 60), index=dates)
+        vrp = compute_vrp(dvol, prices, window=20)
+        self.assertIsInstance(vrp, pd.Series)
+
+    def test_vrp_nan_before_window(self):
+        """First window-1 bars should be NaN (not enough history for realised vol)."""
+        from qlib.contrib.strategy.crypto_payoff import compute_vrp
+        rng = np.random.default_rng(2)
+        n = 40
+        dates = pd.date_range("2022-01-01", periods=n, freq="D")
+        prices = pd.Series(40_000.0 * np.exp(np.cumsum(rng.normal(0, 0.02, n))), index=dates)
+        dvol = pd.Series(80.0, index=dates)
+        vrp = compute_vrp(dvol, prices, window=20)
+        # First 20 bars should be NaN (log-return needs 1 lag, rolling needs 20)
+        self.assertTrue(vrp.iloc[:20].isna().all())
+        self.assertFalse(vrp.iloc[21:].isna().all())
+
+    def test_vrp_positive_when_implied_above_realised(self):
+        """When DVOL >> realised vol, VRP should be positive."""
+        from qlib.contrib.strategy.crypto_payoff import compute_vrp
+        n = 60
+        dates = pd.date_range("2022-01-01", periods=n, freq="D")
+        # Very quiet prices (near-zero returns → tiny realised vol)
+        prices = pd.Series(40_000.0 * np.exp(np.cumsum(np.full(n, 0.0001))), index=dates)
+        dvol = pd.Series(80.0, index=dates)  # 80% IV
+        vrp = compute_vrp(dvol, prices, window=20)
+        self.assertTrue((vrp.dropna() > 0).all(), "VRP should be positive when IV >> realised")
+
+    def test_vrp_in_percent_units(self):
+        """VRP should be in the same percentage-point units as DVOL input."""
+        from qlib.contrib.strategy.crypto_payoff import compute_vrp
+        rng = np.random.default_rng(3)
+        n = 50
+        dates = pd.date_range("2022-01-01", periods=n, freq="D")
+        prices = pd.Series(40_000.0 * np.exp(np.cumsum(rng.normal(0, 0.02, n))), index=dates)
+        dvol = pd.Series(80.0, index=dates)
+        vrp = compute_vrp(dvol, prices, window=20)
+        clean = vrp.dropna()
+        # VRP should be in the range of realistic vol differences: -100 to +100 pp
+        self.assertTrue((clean.abs() < 200).all(), "VRP appears to be in wrong units")
+
+
 class TestRegimeWalkForwardHelpers(unittest.TestCase):
 
     def test_compute_sharpe_zero_for_constant_series(self):
@@ -993,6 +1062,51 @@ class TestRegimeWalkForwardWindowGeneration(unittest.TestCase):
             self.assertEqual(w1_end, w2_start)
             self.assertEqual(w2_end, w3_start)
             self.assertLessEqual(w3_start, w3_end)
+
+
+class TestRegimeWalkForwardAlignLabels(unittest.TestCase):
+
+    def test_align_labels_first_window_returns_identity(self):
+        """On the first window, _align_labels should return the identity permutation."""
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+            import hmmlearn  # noqa
+        except ImportError:
+            self.skipTest("hmmlearn or dateutil not installed")
+
+        from qlib.contrib.model.hmm_regime import _fit_hmm_best_seed
+        rng = np.random.default_rng(10)
+        X = rng.normal(size=(100, 3))
+        _, _, model = _fit_hmm_best_seed(X, n_states=3, n_seeds=2, n_iter=50)
+        fit_bundle = {"hmm_model": model}
+
+        wf = RegimeWalkForward()
+        wf._label_aligner = None  # simulate fresh run
+        perm = wf._align_labels(fit_bundle)
+
+        np.testing.assert_array_equal(perm, np.arange(3))
+
+    def test_align_labels_second_window_no_type_error(self):
+        """Calling _align_labels twice should not raise TypeError (API mismatch bug)."""
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+            import hmmlearn  # noqa
+        except ImportError:
+            self.skipTest("hmmlearn or dateutil not installed")
+
+        from qlib.contrib.model.hmm_regime import _fit_hmm_best_seed
+        rng = np.random.default_rng(11)
+        X = rng.normal(size=(100, 3))
+        _, _, m1 = _fit_hmm_best_seed(X, n_states=3, n_seeds=2, n_iter=50)
+        _, _, m2 = _fit_hmm_best_seed(X, n_states=3, n_seeds=2, n_iter=50)
+
+        wf = RegimeWalkForward()
+        wf._label_aligner = None
+        wf._align_labels({"hmm_model": m1})   # first window
+        perm2 = wf._align_labels({"hmm_model": m2})  # second window — must not raise
+
+        self.assertEqual(len(perm2), 3)
+        self.assertEqual(set(perm2.tolist()), {0, 1, 2})
 
 
 class TestRegimeWalkForwardLeakageCheck(unittest.TestCase):

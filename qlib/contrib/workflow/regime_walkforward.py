@@ -435,6 +435,13 @@ class RegimeWalkForward:
         self.trans_prob_thresh = trans_prob_thresh
         self.random_seed = random_seed
 
+        # Persistent label aligner — reset at the start of each run()
+        self._label_aligner = None
+
+        # Round-trip cost charged once per strategy switch in _simulate_oos.
+        # Default: taker_fee (5 bps) + slippage (0.5 bps) each side × 2 sides.
+        self._switch_cost: float = 2.0 * (0.0005 + 0.00005)
+
     # ------------------------------------------------------------------
     # Configuration dict
     # ------------------------------------------------------------------
@@ -610,48 +617,46 @@ class RegimeWalkForward:
     # HMM label aligner (graceful fallback if module absent)
     # ------------------------------------------------------------------
 
-    def _align_labels(
-        self,
-        prev_map: Optional[Dict[int, int]],
-        fit_bundle: dict,
-        w1_features: pd.DataFrame,
-    ) -> Dict[int, int]:
-        """Align HMM state integer labels across windows using HMMLabelAligner.
+    def _align_labels(self, fit_bundle: dict) -> np.ndarray:
+        """Align HMM state labels across windows using a persistent HMMLabelAligner.
 
-        If the aligner is unavailable (module not yet created), returns the
-        identity mapping so the rest of the pipeline still works.
+        On the first window the model is stored as the reference and the
+        identity permutation is returned.  On subsequent windows the Hungarian
+        algorithm maps new emission means to the stored reference.
+
+        The aligner instance (``self._label_aligner``) is reset at the start
+        of every ``run()`` call so multiple calls are independent.
 
         Parameters
         ----------
-        prev_map : dict or None
-            Previous window's label alignment map ``{raw_state: canonical_state}``.
         fit_bundle : dict
-            Fit bundle from ``_fit_hmm_on_features``.
-        w1_features : pd.DataFrame
-            Daily features used for W1 fitting.
+            As returned by ``_fit_hmm_on_features``; must contain ``"hmm_model"``.
 
         Returns
         -------
-        dict
-            ``{raw_state: canonical_state}``
+        perm : np.ndarray, shape (K,)
+            Permutation array: ``perm[raw_state] = canonical_state``.
+            Apply as ``canonical = perm[raw_states_array]``.
         """
+        hmm_model = fit_bundle["hmm_model"]
+        K = hmm_model.n_components
+
         try:
             from ...contrib.model.hmm_label_aligner import HMMLabelAligner
 
-            aligner = HMMLabelAligner()
-            hmm_model = fit_bundle["hmm_model"]
-            mapping = aligner.align(hmm_model, prev_map)
-            return mapping
+            if self._label_aligner is None:
+                # First window: store reference, return identity
+                self._label_aligner = HMMLabelAligner()
+                self._label_aligner.fit(hmm_model)
+                return np.arange(K)
+            return self._label_aligner.align(hmm_model)
+
         except ImportError:
-            logger.debug(
-                "hmm_label_aligner not found; using identity label mapping."
-            )
-            k = fit_bundle["hmm_model"].n_components
-            return {i: i for i in range(k)}
+            logger.debug("hmm_label_aligner not found; using identity permutation.")
+            return np.arange(K)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("HMMLabelAligner failed (%s); using identity mapping.", exc)
-            k = fit_bundle["hmm_model"].n_components
-            return {i: i for i in range(k)}
+            logger.warning("HMMLabelAligner failed (%s); using identity permutation.", exc)
+            return np.arange(K)
 
     # ------------------------------------------------------------------
     # Per-window simulation
@@ -708,6 +713,10 @@ class RegimeWalkForward:
 
             if prev_strategy is not None and strategy_name != prev_strategy:
                 switch_count += 1
+                # Deduct the round-trip cost of exiting the old position and
+                # entering the new one.  This is the cost that PerpSimulator
+                # no longer charges daily (since positions are held open).
+                pnl_values[i] -= self._switch_cost
             prev_strategy = strategy_name
 
         oos_pnl = pd.Series(pnl_values, index=w3_dates, name="oos_pnl")
@@ -728,8 +737,7 @@ class RegimeWalkForward:
         w3_end: pd.Timestamp,
         features_df: pd.DataFrame,
         strategy_returns_factory: Callable,
-        prev_label_map: Optional[Dict[int, int]],
-    ) -> Tuple[WindowResult, Dict[int, int]]:
+    ) -> WindowResult:
         """Execute one walk-forward window and return (WindowResult, label_map)."""
         from ...contrib.strategy.state_strategy_selector import StateStrategySelector
 
@@ -747,7 +755,7 @@ class RegimeWalkForward:
         fit_bundle = self._fit_hmm_on_features(w1_features)
 
         # ---- Align state labels across windows ----
-        label_map = self._align_labels(prev_label_map, fit_bundle, w1_features)
+        perm = self._align_labels(fit_bundle)
 
         # ---- W2: Decode + select strategies ----
         w2_mask = (daily_features.index >= w2_start) & (daily_features.index < w2_end)
@@ -758,18 +766,23 @@ class RegimeWalkForward:
             )
 
         states_w2, _, _ = self._decode_segment(fit_bundle, w2_features)
-        # Apply label alignment
-        states_w2_aligned = np.array([label_map.get(int(s), int(s)) for s in states_w2])
+        # Apply label alignment permutation
+        states_w2_aligned = perm[states_w2]
         states_w2_series = pd.Series(
             states_w2_aligned, index=w2_features.index, name="state"
         )
 
         w2_strategy_pnl = strategy_returns_factory(w2_start, w2_end)
 
+        # All three guards (min_obs, margin, bootstrap) are enforced inside
+        # StateStrategySelector._select_for_state() — no manual re-application here.
         selector = StateStrategySelector(
             metric=self.selector_metric,
             min_obs=self.selector_min_obs,
             annualization=365,
+            margin=self.selector_margin,
+            bootstrap_n=self.selector_bootstrap_n,
+            bootstrap_hit_rate=self.selector_bootstrap_hit_rate,
         )
         selector.fit(
             states_w2_series,
@@ -777,43 +790,8 @@ class RegimeWalkForward:
             fallback=self.fallback_strategy,
         )
 
-        # Apply margin filter: if best strategy's metric barely beats fallback,
-        # revert to fallback for that state.
-        raw_map = selector.state_strategy_map
+        state_strategy_map = selector.state_strategy_map
         report = selector.report()
-        state_strategy_map: Dict[int, str] = {}
-        for state, strat in raw_map.items():
-            if strat != self.fallback_strategy:
-                state_rows = report[report["state"] == state]
-                best_row = state_rows[state_rows["strategy"] == strat]
-                fb_row = state_rows[state_rows["strategy"] == self.fallback_strategy]
-                if not best_row.empty and not fb_row.empty:
-                    best_score = float(best_row[self.selector_metric].values[0])
-                    fb_score = float(fb_row[self.selector_metric].values[0])
-                    if np.isnan(best_score) or (best_score - fb_score) < self.selector_margin:
-                        strat = self.fallback_strategy
-            state_strategy_map[state] = strat
-
-        # Bootstrap hit-rate confirmation (informational, logged only)
-        for state, strat in state_strategy_map.items():
-            w2_strat_pnl = w2_strategy_pnl.get(strat)
-            if w2_strat_pnl is not None:
-                state_mask_idx = states_w2_series[states_w2_series == state].index
-                pnl_slice = w2_strat_pnl.reindex(state_mask_idx).dropna()
-                if len(pnl_slice) >= 20:
-                    bs_sharpes = _block_bootstrap_sharpe(
-                        pnl_slice,
-                        n_resamples=self.selector_bootstrap_n,
-                        block_size=15,
-                    )
-                    hit_rate = float((bs_sharpes > 0).mean())
-                    if hit_rate < self.selector_bootstrap_hit_rate:
-                        logger.debug(
-                            "Window %d State %d: bootstrap hit-rate %.2f < %.2f "
-                            "for strategy '%s'; consider fallback.",
-                            window_id, state, hit_rate,
-                            self.selector_bootstrap_hit_rate, strat,
-                        )
 
         state_risk_map = selector.state_risk_map()
 
@@ -826,7 +804,7 @@ class RegimeWalkForward:
             )
 
         states_w3, _, trans_prob_w3 = self._decode_segment(fit_bundle, w3_features)
-        states_w3_aligned = np.array([label_map.get(int(s), int(s)) for s in states_w3])
+        states_w3_aligned = perm[states_w3]
         w3_dates = w3_features.index
 
         w3_strategy_pnl = strategy_returns_factory(w3_start, w3_end)
@@ -862,7 +840,7 @@ class RegimeWalkForward:
             n_states_observed=n_states_observed,
             selector_report=report,
         )
-        return result, label_map
+        return result
 
     # ------------------------------------------------------------------
     # Public: run
@@ -920,13 +898,15 @@ class RegimeWalkForward:
             self.oos_months,
         )
 
+        # Reset persistent aligner so each run() is independent
+        self._label_aligner = None
+
         window_results: List[WindowResult] = []
-        prev_label_map: Optional[Dict[int, int]] = None
 
         for idx, (w1_start, w1_end, w2_start, w2_end, w3_start, w3_end) in enumerate(windows):
             window_id = idx + 1
             try:
-                wr, prev_label_map = self._run_window(
+                wr = self._run_window(
                     window_id=window_id,
                     w1_start=w1_start,
                     w1_end=w1_end,
@@ -936,7 +916,6 @@ class RegimeWalkForward:
                     w3_end=w3_end,
                     features_df=features_df,
                     strategy_returns_factory=strategy_returns_factory,
-                    prev_label_map=prev_label_map,
                 )
                 window_results.append(wr)
                 logger.info(
@@ -970,6 +949,10 @@ class RegimeWalkForward:
         result = WalkForwardResult(windows=window_results, config=self._config())
         result._set_baseline_pnl(baselines)
         result._compute_hit_rates(baselines)
+
+        # Record in multiple-testing ledger (guards against repeated tuning)
+        RegimeWalkForward.log_trial(self._config(), result)
+
         return result
 
     # ------------------------------------------------------------------
@@ -1079,20 +1062,22 @@ class RegimeWalkForward:
     # ------------------------------------------------------------------
 
     @classmethod
-    def log_trial(cls, config: dict, result_sharpe: float) -> None:
+    def log_trial(cls, config: dict, result: "WalkForwardResult") -> None:
         """Append a trial record to ``~/.qlib/regime_trials.csv``.
 
-        Computes a Bonferroni-corrected p-value based on the number of
-        trials recorded so far and logs it. This helps guard against
-        over-fitting via excessive hyperparameter search.
+        Computes a Bonferroni-corrected p-value using the walk-forward
+        t-statistic (``WalkForwardResult.sharpe_tstat``) and a t-distribution
+        with ``n_windows - 1`` degrees of freedom.  This guards against
+        p-value inflation from repeated hyperparameter searches.
 
         Parameters
         ----------
         config : dict
             Hyperparameter configuration (will be hashed for deduplication).
-        result_sharpe : float
-            OOS aggregate Sharpe from ``WalkForwardResult.agg_sharpe``.
+        result : WalkForwardResult
+            Full result object; ``agg_sharpe`` and ``sharpe_tstat`` are used.
         """
+        result_sharpe = result.agg_sharpe
         ledger_path = Path.home() / ".qlib" / "regime_trials.csv"
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1120,15 +1105,17 @@ class RegimeWalkForward:
             # Subtract 1 for the header row
             n_trials = max(1, sum(1 for _ in fh) - 1)
 
-        # Heuristic one-sided p-value: approximate normal distribution of Sharpe
-        # under H0: mean=0, std=1 (standardised across bootstraps)
+        # One-sided p-value from the walk-forward t-statistic.
+        # t ~ t(df = n_windows - 1) under H0: mean Sharpe = 0.
         try:
-            from scipy.stats import norm
+            from scipy.stats import t as t_dist
 
-            z = result_sharpe / np.sqrt(max(1.0, result_sharpe))  # crude normalisation
-            raw_p = float(norm.sf(z))
+            t_stat = result.sharpe_tstat
+            n_windows = len(result.windows)
+            df = max(1, n_windows - 1)
+            raw_p = float(t_dist.sf(t_stat, df=df))
             bonferroni_p = min(1.0, raw_p * n_trials)
-        except ImportError:
+        except (ImportError, AttributeError):
             bonferroni_p = float("nan")
 
         logger.info(

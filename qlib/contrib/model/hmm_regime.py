@@ -201,6 +201,10 @@ _BOUNDED_FEATURE_FRAGMENTS = [
 def _bounded_mask(columns: List[str]) -> np.ndarray:
     mask = np.zeros(len(columns), dtype=bool)
     for i, col in enumerate(columns):
+        # Percentile-rank features are already in [0, 1] — power transform is
+        # counter-productive on a near-uniform distribution.
+        if col.endswith("_RANK"):
+            continue
         if any(frag in col for frag in _BOUNDED_FEATURE_FRAGMENTS):
             mask[i] = True
     return mask
@@ -362,7 +366,13 @@ class HMMRegimeModel(BaseModel):
             logger.info("Fitted HMM n_states=%d  ll=%.1f  seed=%d", best_k, best_fit[0], best_fit[1])
 
         self.hmm_model = best_fit[2]
-        states_train = self.hmm_model.predict(X)
+
+        # Use forward-filtered (causal) states for the transition classifier labels
+        # so they match what predict() produces at inference time.  Viterbi uses
+        # the full sequence bidirectionally and would introduce look-ahead bias
+        # in the training labels.
+        filtered_posterior = _forward_filtered(self.hmm_model, X)
+        states_train = np.argmax(filtered_posterior, axis=1)
 
         # --- Fit LightGBM transition classifier ---
         self._fit_transition_model(X, states_train)

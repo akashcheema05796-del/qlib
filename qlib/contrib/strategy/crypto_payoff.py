@@ -268,14 +268,18 @@ class PerpSimulator:
         Notes
         -----
         PnL_t = (price[t+1] / price[t] - 1) - funding_daily[t]
-                - 2*(taker_fee + slippage)
+
+        Transaction costs (entry + exit) are NOT charged per-day because a
+        perpetual position is held open — no daily roll.  Costs are deducted
+        once at position initiation and termination; in the walk-forward engine
+        this is handled by deducting ``_round_trip_cost()`` on every strategy
+        switch in ``_simulate_oos``.
         """
         prices = prices.copy()
         funding_daily = funding_daily.reindex(prices.index)
 
         price_return = prices.shift(-1) / prices - 1.0
-        cost = self._round_trip_cost()
-        pnl = price_return - funding_daily - cost
+        pnl = price_return - funding_daily
 
         # Last day has no t+1 price → NaN (shift already produces NaN there)
         pnl.name = "long_perp"
@@ -307,14 +311,14 @@ class PerpSimulator:
         Notes
         -----
         PnL_t = -(price[t+1] / price[t] - 1) + funding_daily[t]
-                - 2*(taker_fee + slippage)
+
+        Transaction costs are not charged per-day; see ``long_perp`` notes.
         """
         prices = prices.copy()
         funding_daily = funding_daily.reindex(prices.index)
 
         price_return = prices.shift(-1) / prices - 1.0
-        cost = self._round_trip_cost()
-        pnl = -price_return + funding_daily - cost
+        pnl = -price_return + funding_daily
 
         pnl.name = "short_perp"
         return pnl
@@ -362,12 +366,18 @@ class PerpSimulator:
         funding_daily = funding_daily.reindex(prices.index)
 
         ann_funding = funding_daily.abs() * 365.0
-        threshold = min_funding_ann
-        cost = self._round_trip_cost()
+        active = ann_funding >= min_funding_ann
 
-        pnl = funding_daily.abs() - cost
-        # Zero out days where carry is below threshold
-        pnl = pnl.where(ann_funding >= threshold, other=0.0)
+        # Earn the funding on active days
+        pnl = funding_daily.abs().where(active, 0.0)
+
+        # Charge round-trip cost only on days when position status flips
+        # (flat→active = entry; active→flat = exit).
+        transitions = active.astype(int).diff().abs() > 0
+        # Also charge entry on the very first day if already active
+        transitions.iloc[0] = bool(active.iloc[0])
+        cost = self._round_trip_cost()
+        pnl.loc[transitions] -= cost
 
         pnl.name = "funding_carry"
         return pnl
@@ -975,3 +985,50 @@ class OptionSimulator:
             All-zero series with the provided index.
         """
         return pd.Series(0.0, index=index, name="flat_option", dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Variance Risk Premium
+# ---------------------------------------------------------------------------
+
+
+def compute_vrp(
+    dvol: pd.Series,
+    prices: pd.Series,
+    window: int = 20,
+    annualization: int = 365,
+) -> pd.Series:
+    """Variance Risk Premium: DVOL minus annualised realised volatility.
+
+    Both inputs and output are in percentage-point units (e.g. 80.0 = 80% vol).
+    A positive VRP means implied vol exceeds realised vol — the typical condition
+    under which short-vol strategies have a positive expected edge.
+
+    Parameters
+    ----------
+    dvol : pd.Series
+        Deribit DVOL index in annualised % units (e.g. 80.0 for 80% IV).
+    prices : pd.Series
+        Daily close prices used to compute realised volatility.
+    window : int, default 20
+        Rolling window (in days) for realised vol estimation.
+    annualization : int, default 365
+        Trading days per year (365 for crypto, 252 for equity).
+
+    Returns
+    -------
+    pd.Series
+        VRP = DVOL − realised_vol_ann, indexed to dvol.index.
+        Positive ↔ implied > realised (vol sellers have edge).
+        NaN where either input is missing.
+
+    Notes
+    -----
+    Realised vol is computed as the rolling standard deviation of log returns
+    over ``window`` days, annualised by ``sqrt(annualization) * 100``.
+    """
+    log_ret = np.log(prices / prices.shift(1))
+    realised_vol_pct = log_ret.rolling(window).std() * math.sqrt(annualization) * 100.0
+    vrp = dvol.reindex(prices.index) - realised_vol_pct
+    vrp.name = "vrp"
+    return vrp
