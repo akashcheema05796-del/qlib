@@ -44,6 +44,8 @@ all_model_classes = (CatBoostModel, DEnsembleModel, LGBModel, XGBModel, LinearMo
 
 try:
     from .hmm_regime import HMMRegimeModel
+    from .hmm_label_aligner import HMMLabelAligner
 except ImportError:
     HMMRegimeModel = None
-    print("ImportError. HMMRegimeModel is skipped (optional: install hmmlearn with `pip install hmmlearn`).")
+    HMMLabelAligner = None
+    print("ImportError. HMMRegimeModel/HMMLabelAligner are skipped (optional: install hmmlearn with `pip install hmmlearn`).")

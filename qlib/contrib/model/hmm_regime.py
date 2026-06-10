@@ -83,18 +83,79 @@ def _fit_hmm_best_seed(
 
 
 def _bic(model, X: np.ndarray) -> float:
-    """Bayesian Information Criterion for a fitted GaussianHMM."""
+    """Bayesian Information Criterion for a fitted GaussianHMM.
+
+    Note: hmmlearn's score() returns the *total* log-likelihood of the full
+    sequence, so it must NOT be multiplied by n.
+    """
     n, d = X.shape
     k = model.n_components
     # Parameters: transition matrix + means + full covariances + initial probs
     n_params = k * (k - 1) + k * d + k * d * (d + 1) / 2 + (k - 1)
-    return -2 * model.score(X) * n + n_params * np.log(n)
+    return -2 * model.score(X) + n_params * np.log(n)
 
 
 def _posterior_entropy(posterior: np.ndarray) -> np.ndarray:
     """H(t) = -sum_k p_k * log(p_k). Low when model is certain about state."""
     p = np.clip(posterior, 1e-12, 1.0)
     return np.maximum(0.0, -(p * np.log(p)).sum(axis=1))
+
+
+def _apply_hysteresis(
+    states: np.ndarray,
+    posterior: np.ndarray,
+    min_prob: float = 0.70,
+    min_bars: int = 3,
+) -> np.ndarray:
+    """Apply hysteresis to a filtered state sequence to suppress chatter.
+
+    A state switch is only committed when the new state has been the
+    argmax for ``min_bars`` consecutive bars AND its posterior probability
+    exceeds ``min_prob``.  Until then the current state is held.
+
+    This prevents high transaction-cost chatter on noisy regime boundaries
+    where the filtered posterior oscillates between two states.
+
+    Parameters
+    ----------
+    states : np.ndarray, shape (T,)
+        Raw argmax state sequence from the forward filter.
+    posterior : np.ndarray, shape (T, K)
+        Normalised filtered probabilities.
+    min_prob : float
+        Minimum filtered probability required to commit a state change.
+    min_bars : int
+        Minimum consecutive bars the candidate state must be argmax
+        before the switch is committed.
+
+    Returns
+    -------
+    confirmed : np.ndarray, shape (T,)
+        Hysteresis-smoothed state sequence.
+    """
+    T = len(states)
+    confirmed = states.copy()
+    current = int(states[0])
+    candidate = int(states[0])
+    candidate_count = 0
+
+    for t in range(1, T):
+        proposed = int(states[t])
+        if proposed != current:
+            if proposed == candidate:
+                candidate_count += 1
+                if candidate_count >= min_bars and posterior[t, proposed] >= min_prob:
+                    current = proposed
+                    candidate_count = 0
+            else:
+                candidate = proposed
+                candidate_count = 1
+        else:
+            candidate = proposed
+            candidate_count = 0
+        confirmed[t] = current
+
+    return confirmed
 
 
 def _forward_filtered(model, X: np.ndarray) -> np.ndarray:
@@ -207,6 +268,8 @@ class HMMRegimeModel(BaseModel):
         transition_horizon: int = 5,
         transition_lags: Optional[List[int]] = None,
         lgb_params: Optional[Dict] = None,
+        hysteresis_prob: float = 0.70,
+        hysteresis_bars: int = 3,
     ):
         self.n_states = n_states
         self.max_states = max_states
@@ -214,6 +277,8 @@ class HMMRegimeModel(BaseModel):
         self.n_iter = n_iter
         self.transition_horizon = transition_horizon
         self.transition_lags = transition_lags or [1, 2, 3, 5]
+        self.hysteresis_prob = hysteresis_prob
+        self.hysteresis_bars = hysteresis_bars
         self.lgb_params = lgb_params or {
             "objective": "binary",
             "learning_rate": 0.05,
@@ -386,18 +451,25 @@ class HMMRegimeModel(BaseModel):
 
         if decode == "filtered":
             posterior = _forward_filtered(self.hmm_model, X)
-            states = np.argmax(posterior, axis=1)
+            raw_states = np.argmax(posterior, axis=1)
+            states = _apply_hysteresis(
+                raw_states, posterior,
+                min_prob=self.hysteresis_prob,
+                min_bars=self.hysteresis_bars,
+            )
+            logger.debug(
+                "Hysteresis applied: %d of %d bars had state held (%.1f%% chatter suppressed).",
+                int((states != raw_states).sum()), len(states),
+                100.0 * (states != raw_states).mean(),
+            )
         elif decode == "viterbi":
             states = self.hmm_model.predict(X)
             posterior = self.hmm_model.predict_proba(X)
+            logger.debug("Viterbi decoding — look-ahead bias present; post-hoc analysis only.")
         else:  # smooth
             posterior = self.hmm_model.predict_proba(X)
             states = np.argmax(posterior, axis=1)
-
-        if decode == "viterbi":
-            logger.debug("Using Viterbi decoding — look-ahead bias present; suitable for post-hoc analysis only.")
-        elif decode == "smooth":
-            logger.debug("Using smoothed decoding — look-ahead bias present; suitable for post-hoc analysis only.")
+            logger.debug("Smoothed decoding — look-ahead bias present; post-hoc analysis only.")
 
         entropy = _posterior_entropy(posterior)
         top_prob = posterior.max(axis=1)

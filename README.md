@@ -569,6 +569,114 @@ Most general-purpose databases take too much time to load data. After looking in
 Such overheads greatly slow down the data loading process.
 Qlib data are stored in a compact format, which is efficient to be combined into arrays for scientific computation.
 
+# Regime-Conditioned Crypto Derivatives
+
+This extension adds an HMM-based market regime classifier and a full walk-forward backtesting workflow for crypto derivatives strategies (perpetual futures + weekly options).
+
+## System Overview
+
+```
+OHLCV + Funding + DVOL
+        │
+        ▼
+RegimeDataHandler  ── vol-relative (percentile-rank) features
+        │
+        ▼
+HMMRegimeModel     ── GaussianHMM, BIC sweep, multi-seed, hysteresis filter
+        │
+        ▼
+HMMLabelAligner    ── Hungarian assignment to prevent label switching on refit
+        │
+        ▼
+StateStrategySelector ── min_obs / margin / bootstrap guards → state→strategy map
+        │
+        ▼
+RegimeWalkForward  ── W1 fit / W2 select / W3 OOS rolling protocol
+        │
+        ▼
+WalkForwardResult  ── OOS PnL, Sharpe, Calmar, leakage test, trial ledger
+```
+
+**Key design decisions:**
+
+| Decision | Rationale |
+|---|---|
+| `K=3` states fixed | Bull / Bear / High-Vol; BIC sweep available as `n_states="auto"` |
+| Annualisation = 365 | Crypto trades 24/7 |
+| `min_obs=80` per state | SE of Sharpe ≈ ±2.1; 20 obs (old default) gave SE ±4.3 |
+| Percentile-rank vol features | BTC vol compressed 100%→45% (2018→2024); raw levels are non-stationary |
+| Forward-filtered decode | Causal — no look-ahead bias |
+| Hysteresis gate (prob ≥ 0.70, 3 bars) | Prevents fee bleed from state chatter |
+| Black-76 option pricing | Forward model; Deribit DVOL as IV for realistic PnL |
+
+## Installation
+
+```bash
+pip install -r requirements/regime_classifier.txt
+```
+
+The regime classifier requires `hmmlearn>=0.3.0` and `scipy>=1.11.0` in addition to
+the standard Qlib dependencies.
+
+## Quick Start
+
+### 1. Download data
+
+```bash
+# OHLCV — Binance spot
+python scripts/data_collector/crypto_binance/collector.py \
+    --symbols BTCUSDT ETHUSDT \
+    --start_date 2019-01-01
+
+# Funding rates (perp strategies)
+python scripts/data_collector/crypto_binance/funding_collector.py \
+    --symbols BTCUSDT ETHUSDT \
+    --start_date 2019-09-01
+
+# Deribit DVOL (option strategies — from 2021-07 only)
+python scripts/data_collector/crypto_deribit/dvol_collector.py \
+    --currencies BTC ETH \
+    --start_date 2021-07-01
+```
+
+### 2. Run the full walk-forward backtest
+
+```bash
+python examples/regime_classifier/crypto_workflow.py run \
+    --instruments BTCUSDT ETHUSDT \
+    --data_dir ~/.qlib/qlib_data/crypto_binance
+```
+
+### 3. Run on the sealed holdout (2024-Q4 onward — only once!)
+
+```bash
+python examples/regime_classifier/crypto_workflow.py holdout \
+    --instruments BTCUSDT ETHUSDT \
+    --data_dir ~/.qlib/qlib_data/crypto_binance
+```
+
+## Module Reference
+
+| Module | Description |
+|---|---|
+| `qlib/contrib/data/handler_regime.py` | `RegimeDataHandler` — 18 stationary OHLCV features |
+| `qlib/contrib/model/hmm_regime.py` | `HMMRegimeModel` — GaussianHMM with BIC, hysteresis |
+| `qlib/contrib/model/hmm_label_aligner.py` | `HMMLabelAligner` — Hungarian alignment across refits |
+| `qlib/contrib/strategy/crypto_payoff.py` | `PerpSimulator`, `OptionSimulator` — daily PnL series |
+| `qlib/contrib/strategy/state_strategy_selector.py` | `StateStrategySelector` — hardened regime→strategy mapping |
+| `qlib/contrib/strategy/regime_gated.py` | `RegimeGatedStrategy` — runtime risk-degree gating |
+| `qlib/contrib/workflow/regime_walkforward.py` | `RegimeWalkForward` — W1/W2/W3 rolling protocol |
+| `examples/regime_classifier/crypto_workflow.py` | End-to-end CLI |
+| `scripts/data_collector/crypto_binance/` | Binance OHLCV + funding collectors |
+| `scripts/data_collector/crypto_deribit/` | Deribit DVOL collector |
+
+## Project Plan
+
+See [`docs/REGIME_PROJECT_PLAN.md`](docs/REGIME_PROJECT_PLAN.md) for the full
+9-phase implementation plan, statistical validation protocol, and risk register.
+
+---
+
 # Related Reports
 - [Guide To Qlib: Microsoft’s AI Investment Platform](https://analyticsindiamag.com/qlib/)
 - [微软也搞AI量化平台？还是开源的！](https://mp.weixin.qq.com/s/47bP5YwxfTp2uTHjUBzJQQ)

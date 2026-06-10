@@ -1,6 +1,6 @@
-#  Copyright (c) Microsoft Corporation.
-#  Licensed under the MIT License.
-from .record_temp import MultiSegRecord
-from .record_temp import SignalMseRecord
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
-__all__ = ["MultiSegRecord", "SignalMseRecord"]
+from .regime_walkforward import RegimeWalkForward, WalkForwardResult, WindowResult
+
+__all__ = ["RegimeWalkForward", "WalkForwardResult", "WindowResult"]

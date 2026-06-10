@@ -1,0 +1,35 @@
+# Requirements for the regime-conditioned crypto derivatives workflow.
+#
+# Install with:
+#   pip install -r requirements/regime_classifier.txt
+#
+# Core Qlib dependencies are assumed to be already installed.
+# These extras are needed only for the regime classifier modules.
+
+# HMM state-space model
+hmmlearn>=0.3.0
+
+# Gradient-boosted transition classifier (optional but recommended)
+lightgbm>=4.0.0
+
+# Scikit-learn preprocessing (PowerTransformer, StandardScaler)
+scikit-learn>=1.3.0
+
+# Hungarian label alignment, Black-76 option pricing
+scipy>=1.11.0
+
+# Data manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# HTTP requests for Binance / Deribit data collectors
+requests>=2.31.0
+
+# CLI interface for crypto_workflow.py
+fire>=0.5.0
+
+# Calendar-accurate month arithmetic in walk-forward windows
+python-dateutil>=2.8.0
+
+# Optional: interactive plots from WalkForwardResult.plot_oos_pnl()
+matplotlib>=3.7.0
