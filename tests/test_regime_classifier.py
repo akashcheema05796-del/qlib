@@ -1122,7 +1122,10 @@ class TestRegimeWalkForwardLeakageCheck(unittest.TestCase):
         except ImportError:
             self.skipTest("hmmlearn not installed")
 
-        wf = RegimeWalkForward(fit_months=6, select_months=3, oos_months=3)
+        wf = RegimeWalkForward(
+            fit_months=6, select_months=3, oos_months=3,
+            hmm_n_seeds=2, selector_min_obs=20, selector_bootstrap_n=50,
+        )
 
         rng = np.random.default_rng(42)
         dates = pd.date_range("2020-01-01", periods=600, freq="B")
@@ -1130,8 +1133,9 @@ class TestRegimeWalkForwardLeakageCheck(unittest.TestCase):
                             index=dates,
                             columns=["f1", "f2", "f3", "f4"])
 
-        def factory(states, idx):
-            return {"Flat": pd.Series(0.0, index=idx)}
+        def factory(start, end):
+            mask = (dates >= start) & (dates < end)
+            return {"Flat": pd.Series(0.0, index=dates[mask])}
 
         # Should complete without raising
         try:
@@ -1279,6 +1283,189 @@ class TestEndToEnd(unittest.TestCase):
         sel = StateStrategySelector(metric="sharpe", min_obs=20, annualization=365)
         sel.fit(states, strategy_returns, fallback="Flat")
         self.assertIsNotNone(sel.state_strategy_map)
+
+
+# ---------------------------------------------------------------------------
+# Gap fix tests
+# ---------------------------------------------------------------------------
+
+class TestHACTstat(unittest.TestCase):
+    """Gap 10: HAC-corrected Sharpe t-stat in WalkForwardResult."""
+
+    def _make_result(self, pnl_values):
+        """Build a minimal WalkForwardResult from a list of daily PnL arrays."""
+        try:
+            from qlib.contrib.workflow.regime_walkforward import (
+                WalkForwardResult, WindowResult,
+            )
+        except ImportError:
+            return None
+        windows = []
+        for i, vals in enumerate(pnl_values):
+            dates = pd.date_range("2020-01-01", periods=len(vals), freq="D")
+            pnl = pd.Series(vals, index=dates, name="oos_pnl")
+            sharpe = float(pnl.mean() / (pnl.std() + 1e-12) * np.sqrt(365))
+            windows.append(WindowResult(
+                window_id=i + 1,
+                w1_start=dates[0], w3_end=dates[-1],
+                state_strategy_map={0: "Flat"}, state_risk_map={0: 1.0},
+                oos_pnl=pnl, oos_sharpe=sharpe, oos_calmar=0.0,
+                oos_max_dd=0.0, oos_win_rate=0.5, switch_count=0,
+                n_states_observed=1, selector_report=pd.DataFrame(),
+            ))
+        return WalkForwardResult(windows=windows, config={})
+
+    def test_hac_tstat_is_finite(self):
+        rng = np.random.default_rng(7)
+        pnls = [rng.normal(0.001, 0.02, 90) for _ in range(4)]
+        result = self._make_result(pnls)
+        if result is None:
+            self.skipTest("walkforward module unavailable")
+        self.assertTrue(np.isfinite(result.sharpe_tstat))
+
+    def test_hac_tstat_positive_for_positive_pnl(self):
+        pnls = [np.full(90, 0.002) for _ in range(4)]
+        result = self._make_result(pnls)
+        if result is None:
+            self.skipTest("walkforward module unavailable")
+        self.assertGreater(result.sharpe_tstat, 0.0)
+
+    def test_hac_tstat_zero_for_zero_pnl(self):
+        pnls = [np.zeros(90) for _ in range(4)]
+        result = self._make_result(pnls)
+        if result is None:
+            self.skipTest("walkforward module unavailable")
+        self.assertEqual(result.sharpe_tstat, 0.0)
+
+
+class TestDVOLWeekendFill(unittest.TestCase):
+    """Gap 12: DVOL forward-fill over weekend gaps."""
+
+    def test_weekend_gaps_filled(self):
+        from qlib.contrib.strategy.crypto_payoff import OptionSimulator
+        sim = OptionSimulator()
+        # Prices on a 7-day calendar (including weekends)
+        prices_idx = pd.date_range("2023-01-02", periods=10, freq="D")
+        prices = pd.Series(20_000.0, index=prices_idx)
+        # DVOL only on business days (Mon-Fri), skip Sat/Sun
+        dvol_idx = pd.bdate_range("2023-01-02", periods=8)
+        dvol = pd.Series(70.0, index=dvol_idx)
+        result = sim._validate_dvol(prices, dvol)
+        # Weekend days should now be non-NaN (filled from Friday)
+        sat = pd.Timestamp("2023-01-07")
+        sun = pd.Timestamp("2023-01-08")
+        if sat in result.index:
+            self.assertFalse(pd.isna(result.loc[sat]), "Saturday DVOL should be forward-filled")
+        if sun in result.index:
+            self.assertFalse(pd.isna(result.loc[sun]), "Sunday DVOL should be forward-filled")
+
+    def test_none_dvol_returns_none(self):
+        from qlib.contrib.strategy.crypto_payoff import OptionSimulator
+        sim = OptionSimulator()
+        prices = pd.Series(1.0, index=pd.date_range("2023-01-01", periods=5))
+        self.assertIsNone(sim._validate_dvol(prices, None))
+
+    def test_long_gap_not_filled(self):
+        from qlib.contrib.strategy.crypto_payoff import OptionSimulator
+        sim = OptionSimulator()
+        prices_idx = pd.date_range("2023-01-01", periods=10, freq="D")
+        prices = pd.Series(1.0, index=prices_idx)
+        # DVOL only on day 0 and day 9 — 8-day gap should NOT fill (limit=3)
+        dvol = pd.Series({prices_idx[0]: 70.0, prices_idx[9]: 70.0})
+        result = sim._validate_dvol(prices, dvol)
+        # Day 5 (5 days into gap) should still be NaN
+        self.assertTrue(pd.isna(result.iloc[5]))
+
+
+class TestVolTargeting(unittest.TestCase):
+    """Gap 17: Vol-targeting in RegimeWalkForward.__init__ and _simulate_oos."""
+
+    def test_vol_target_default(self):
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward()
+        self.assertEqual(wf.vol_target, 0.40)
+        self.assertEqual(wf.vol_target_window, 20)
+
+    def test_vol_target_none_disables(self):
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward(vol_target=None)
+        self.assertIsNone(wf.vol_target)
+
+    def test_vol_target_in_config(self):
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward(vol_target=0.30, vol_target_window=15)
+        cfg = wf._config()
+        self.assertEqual(cfg["vol_target"], 0.30)
+        self.assertEqual(cfg["vol_target_window"], 15)
+
+
+class TestHmmInstrument(unittest.TestCase):
+    """Gap 6: hmm_instrument parameter for single-asset HMM."""
+
+    def test_default_is_none(self):
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward()
+        self.assertIsNone(wf.hmm_instrument)
+
+    def test_instrument_in_config(self):
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward(hmm_instrument="btcusdt")
+        self.assertEqual(wf._config()["hmm_instrument"], "btcusdt")
+
+    def test_get_daily_features_plain_index(self):
+        """With plain DatetimeIndex, _get_daily_features should pass through unchanged."""
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward(hmm_instrument="btcusdt")
+        idx = pd.date_range("2020-01-01", periods=10, freq="D")
+        df = pd.DataFrame({"f1": 1.0, "f2": 2.0}, index=idx)
+        result = wf._get_daily_features(df)
+        self.assertEqual(len(result), 10)
+
+    def test_get_daily_features_multiindex_slices(self):
+        """With MultiIndex and hmm_instrument set, should return only that instrument."""
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward(hmm_instrument="btcusdt")
+        dates = pd.date_range("2020-01-01", periods=5, freq="D")
+        tuples = [(d, inst) for d in dates for inst in ["btcusdt", "ethusdt"]]
+        idx = pd.MultiIndex.from_tuples(tuples, names=["datetime", "instrument"])
+        df = pd.DataFrame({"f1": range(len(tuples))}, index=idx)
+        result = wf._get_daily_features(df)
+        self.assertEqual(len(result), 5)  # one row per date, not two
+
+    def test_get_daily_features_fallback_on_missing(self):
+        """If hmm_instrument not in MultiIndex, should fall back to cross-sectional mean."""
+        try:
+            from qlib.contrib.workflow.regime_walkforward import RegimeWalkForward
+        except ImportError:
+            self.skipTest("walkforward not available")
+        wf = RegimeWalkForward(hmm_instrument="xrpusdt")
+        dates = pd.date_range("2020-01-01", periods=5, freq="D")
+        tuples = [(d, inst) for d in dates for inst in ["btcusdt", "ethusdt"]]
+        idx = pd.MultiIndex.from_tuples(tuples, names=["datetime", "instrument"])
+        df = pd.DataFrame({"f1": [float(i) for i in range(len(tuples))]}, index=idx)
+        result = wf._get_daily_features(df)
+        self.assertEqual(len(result), 5)  # cross-sectional mean: 5 dates
 
 
 if __name__ == "__main__":

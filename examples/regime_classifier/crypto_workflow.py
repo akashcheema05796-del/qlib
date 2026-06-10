@@ -153,6 +153,95 @@ def download_data(
 
 
 # ---------------------------------------------------------------------------
+# Step 1b — Post-download data quality validation
+# ---------------------------------------------------------------------------
+
+def validate_data(
+    ohlcv_dir: str = CFG["ohlcv_dir"],
+    funding_dir: str = CFG["funding_dir"],
+    dvol_dir: str = CFG["dvol_dir"],
+):
+    """Validate downloaded data: check for gaps, stale prices, and missing files."""
+    issues = []
+
+    for symbol in CFG["instruments"]:
+        # --- OHLCV close ---
+        ohlcv_path = Path(ohlcv_dir).expanduser() / "features" / symbol / "close.csv"
+        if not ohlcv_path.exists():
+            issues.append(f"MISSING OHLCV: {ohlcv_path}")
+        else:
+            df = pd.read_csv(ohlcv_path, index_col=0, parse_dates=True)
+            if df.empty:
+                issues.append(f"EMPTY OHLCV: {ohlcv_path}")
+            else:
+                gaps = df.index.to_series().diff().dt.days.dropna()
+                large_gaps = gaps[gaps > 3]
+                if len(large_gaps):
+                    issues.append(
+                        f"GAPS in {symbol} OHLCV: {len(large_gaps)} gaps > 3 days "
+                        f"(largest: {int(large_gaps.max())}d at {large_gaps.idxmax().date()})"
+                    )
+                close = df.iloc[:, 0].dropna()
+                if len(close) > 7:
+                    stale = (close.diff().abs() < 1e-10).rolling(7).sum()
+                    if stale.max() >= 7:
+                        issues.append(f"STALE PRICES in {symbol} OHLCV: 7+ repeated close values")
+                if close.min() <= 0:
+                    issues.append(f"NEGATIVE/ZERO PRICES in {symbol} OHLCV")
+
+        # --- Funding ---
+        fund_path = Path(funding_dir).expanduser() / "features" / symbol / "funding.csv"
+        if not fund_path.exists():
+            issues.append(f"MISSING FUNDING: {fund_path}")
+        else:
+            df = pd.read_csv(fund_path, index_col=0, parse_dates=True)
+            if df.empty:
+                issues.append(f"EMPTY FUNDING: {fund_path}")
+            else:
+                na_frac = df.iloc[:, 0].isna().mean()
+                if na_frac > 0.30:
+                    issues.append(
+                        f"HIGH NaN RATE in {symbol} funding: {na_frac:.1%} missing"
+                    )
+
+        # --- DVOL ---
+        dvol_symbol = symbol.replace("usdt", "").upper()
+        dvol_path = Path(dvol_dir).expanduser() / "features" / dvol_symbol / "dvol.csv"
+        if not dvol_path.exists():
+            issues.append(f"MISSING DVOL: {dvol_path}  (options unavailable)")
+        else:
+            df = pd.read_csv(dvol_path, index_col=0, parse_dates=True)
+            if df.empty:
+                issues.append(f"EMPTY DVOL: {dvol_path}")
+            else:
+                na_frac = df.iloc[:, 0].isna().mean()
+                if na_frac > 0.20:
+                    issues.append(
+                        f"HIGH NaN RATE in {dvol_symbol} DVOL: {na_frac:.1%} missing"
+                    )
+                dv = df.iloc[:, 0].dropna()
+                if (dv < 5).any() or (dv > 500).any():
+                    issues.append(
+                        f"DVOL OUT OF RANGE in {dvol_symbol}: "
+                        f"min={dv.min():.1f}, max={dv.max():.1f} (expected 5–500)"
+                    )
+
+    print("\n" + "=" * 60)
+    print("DATA QUALITY REPORT")
+    print("=" * 60)
+    if issues:
+        print(f"Found {len(issues)} issue(s):\n")
+        for i, iss in enumerate(issues, 1):
+            print(f"  [{i}] {iss}")
+        print()
+        logger.warning("Data validation found %d issue(s). Review before running.", len(issues))
+    else:
+        print("All checks passed. Data looks healthy.")
+    print("=" * 60 + "\n")
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Qlib initialisation
 # ---------------------------------------------------------------------------
 
@@ -281,10 +370,11 @@ def run(
 
     def strategy_returns_factory(start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, pd.Series]:
         """Return dict of strategy daily PnL for a given date range."""
+        from qlib.contrib.strategy.crypto_payoff import compute_vrp
         idx = pd.date_range(start, end, freq="D")
         p = prices_btc.reindex(idx).ffill()
         f = funding_btc.reindex(idx).fillna(0)
-        d = dvol_btc.reindex(idx)
+        d = dvol_btc.reindex(idx).ffill(limit=3)  # fill weekend DVOL gaps
 
         returns = {
             "LongPerp":     perp.long_perp(p, f),
@@ -294,9 +384,14 @@ def run(
         }
         # Options only available from 2021-07
         if start >= pd.Timestamp(CFG["options_start"]) and d.notna().any():
-            returns["ShortStraddle"] = opt.short_straddle(p, d)
+            raw_straddle = opt.short_straddle(p, d)
+            returns["ShortStraddle"] = raw_straddle
             returns["IronCondor"]    = opt.iron_condor(p, d)
             returns["BullPutSpread"] = opt.bull_put_spread(p, d)
+            # VRP-gated straddle: only short vol when implied > realised (VRP > 0)
+            vrp = compute_vrp(d, p, window=20, annualization=CFG["annualization"])
+            vrp_positive = vrp.reindex(raw_straddle.index) > 0
+            returns["VRPShortStraddle"] = raw_straddle.where(vrp_positive, 0.0)
 
         return returns
 
@@ -493,6 +588,7 @@ def _extract_series(funding_df, dvol_df, provider_uri, end_date):
 if __name__ == "__main__":
     fire.Fire({
         "download_data": download_data,
+        "validate_data": validate_data,
         "predict_only":  predict_only,
         "run":           run,
         "holdout":       holdout,

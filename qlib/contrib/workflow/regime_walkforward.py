@@ -20,6 +20,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -276,11 +277,28 @@ class WalkForwardResult:
         self.agg_sharpe = float(np.mean(sharpes)) if n else 0.0
         self.agg_sharpe_std = float(np.std(sharpes, ddof=1)) if n > 1 else 0.0
         self.agg_sharpe_min = float(np.min(sharpes)) if n else 0.0
-        self.sharpe_tstat = (
-            self.agg_sharpe / self.agg_sharpe_std * np.sqrt(n)
-            if (n > 1 and self.agg_sharpe_std > 0)
-            else 0.0
-        )
+        # HAC (Newey-West) t-stat on concatenated OOS PnL — corrects for serial autocorrelation
+        try:
+            all_pnl = pd.concat([w.oos_pnl for w in self.windows]).sort_index().dropna()
+            _n = len(all_pnl)
+            if _n >= 4:
+                r = all_pnl.values
+                mean_r = r.mean()
+                nw_lag = max(1, int(np.floor(4.0 * (_n / 100.0) ** (2.0 / 9.0))))
+                gamma0 = float(np.mean((r - mean_r) ** 2))
+                hac_var = gamma0
+                for h in range(1, nw_lag + 1):
+                    w_h = 1.0 - h / (nw_lag + 1.0)  # Bartlett kernel
+                    gamma_h = float(np.mean((r[h:] - mean_r) * (r[:-h] - mean_r)))
+                    hac_var += 2.0 * w_h * gamma_h
+                se_hac = float(np.sqrt(max(hac_var, 0.0) / _n))
+                self.sharpe_tstat = (
+                    float(mean_r / se_hac * np.sqrt(365)) if se_hac > 0.0 else 0.0
+                )
+            else:
+                self.sharpe_tstat = 0.0
+        except Exception:
+            self.sharpe_tstat = 0.0
         self.agg_calmar = float(np.mean([w.oos_calmar for w in self.windows])) if n else 0.0
         self.agg_max_dd = float(max((w.oos_max_dd for w in self.windows), default=0.0))
         self.hit_rate_vs_baseline = {}
@@ -417,6 +435,9 @@ class RegimeWalkForward:
         fallback_strategy: str = "FundingCarry",
         trans_prob_thresh: float = 0.45,
         random_seed: int = 42,
+        hmm_instrument: Optional[str] = None,
+        vol_target: Optional[float] = 0.40,
+        vol_target_window: int = 20,
     ) -> None:
         self.fit_months = fit_months
         self.select_months = select_months
@@ -434,6 +455,9 @@ class RegimeWalkForward:
         self.fallback_strategy = fallback_strategy
         self.trans_prob_thresh = trans_prob_thresh
         self.random_seed = random_seed
+        self.hmm_instrument = hmm_instrument
+        self.vol_target = vol_target
+        self.vol_target_window = vol_target_window
 
         # Persistent label aligner — reset at the start of each run()
         self._label_aligner = None
@@ -464,7 +488,35 @@ class RegimeWalkForward:
             "fallback_strategy": self.fallback_strategy,
             "trans_prob_thresh": self.trans_prob_thresh,
             "random_seed": self.random_seed,
+            "hmm_instrument": self.hmm_instrument,
+            "vol_target": self.vol_target,
+            "vol_target_window": self.vol_target_window,
         }
+
+    # ------------------------------------------------------------------
+    # Feature extraction — respects hmm_instrument setting
+    # ------------------------------------------------------------------
+
+    def _get_daily_features(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """Return daily feature DataFrame for HMM fitting/decoding.
+
+        When ``hmm_instrument`` is set and the input has a MultiIndex, slices
+        out only that instrument instead of taking the cross-sectional mean.
+        Falls back to the cross-sectional mean if the instrument is not found.
+        """
+        if self.hmm_instrument is not None and isinstance(features_df.index, pd.MultiIndex):
+            try:
+                inst_level = features_df.index.names.index("instrument")
+            except ValueError:
+                inst_level = 1
+            try:
+                return features_df.xs(self.hmm_instrument, level=inst_level)
+            except KeyError:
+                logger.warning(
+                    "hmm_instrument=%r not found in features; using cross-sectional mean.",
+                    self.hmm_instrument,
+                )
+        return _extract_daily_features(features_df)
 
     # ------------------------------------------------------------------
     # Window generation
@@ -700,6 +752,13 @@ class RegimeWalkForward:
             else:
                 exposure = risk_degree
 
+            # Vol-targeting: scale so realised portfolio vol ≈ vol_target (cap 2×)
+            if self.vol_target is not None and i >= self.vol_target_window:
+                window_pnl = pnl_values[max(0, i - self.vol_target_window):i]
+                rv = float(np.std(window_pnl)) * math.sqrt(365)
+                if rv > 0.0:
+                    exposure = exposure * min(self.vol_target / rv, 2.0)
+
             # Look up daily PnL for the chosen strategy
             strat_series = strategy_pnl.get(strategy_name)
             if strat_series is None:
@@ -741,7 +800,7 @@ class RegimeWalkForward:
         """Execute one walk-forward window and return (WindowResult, label_map)."""
         from ...contrib.strategy.state_strategy_selector import StateStrategySelector
 
-        daily_features = _extract_daily_features(features_df)
+        daily_features = self._get_daily_features(features_df)
 
         # ---- W1: Fit HMM ----
         w1_mask = (daily_features.index >= w1_start) & (daily_features.index < w1_end)
@@ -874,7 +933,7 @@ class RegimeWalkForward:
             baselines = {}
 
         # Determine date range from features
-        daily_features = _extract_daily_features(features_df)
+        daily_features = self._get_daily_features(features_df)
         min_date = daily_features.index.min()
         max_date = daily_features.index.max()
 
@@ -980,25 +1039,16 @@ class RegimeWalkForward:
         AssertionError
             If any W3 date appears in a W1 or W2 window.
         """
-        logger.info("LeakageCheck: running normal protocol ...")
-        normal_result = self.run(features_df, strategy_returns_factory)
-
-        # Date non-overlap assertion
-        daily_features = _extract_daily_features(features_df)
-        windows = self._generate_windows(
-            daily_features.index.min(), daily_features.index.max()
-        )
+        # 1. Fast date non-overlap assertion (cheap: no HMM fitting required)
+        daily_features = self._get_daily_features(features_df)
+        windows = self._generate_windows(daily_features.index.min(), daily_features.index.max())
         for w1_start, w1_end, w2_start, w2_end, w3_start, w3_end in windows:
             w3_mask = (daily_features.index >= w3_start) & (daily_features.index < w3_end)
             w3_dates = set(daily_features.index[w3_mask])
-
             w1_mask = (daily_features.index >= w1_start) & (daily_features.index < w1_end)
-            w1_dates = set(daily_features.index[w1_mask])
+            overlap_w1 = w3_dates & set(daily_features.index[w1_mask])
             w2_mask = (daily_features.index >= w2_start) & (daily_features.index < w2_end)
-            w2_dates = set(daily_features.index[w2_mask])
-
-            overlap_w1 = w3_dates & w1_dates
-            overlap_w2 = w3_dates & w2_dates
+            overlap_w2 = w3_dates & set(daily_features.index[w2_mask])
             assert not overlap_w1, (
                 f"LeakageCheck: {len(overlap_w1)} W3 dates appear in W1 "
                 f"[{w1_start.date()}, {w1_end.date()})"
@@ -1008,7 +1058,11 @@ class RegimeWalkForward:
                 f"[{w2_start.date()}, {w2_end.date()})"
             )
 
-        # Shifted-features run
+        # 2. Normal run
+        logger.info("LeakageCheck: running normal protocol ...")
+        normal_result = self.run(features_df, strategy_returns_factory)
+
+        # 3. Shifted-features run
         logger.info("LeakageCheck: running shifted (+1 day) protocol ...")
         shifted_features = features_df.copy()
         if isinstance(shifted_features.index, pd.MultiIndex):

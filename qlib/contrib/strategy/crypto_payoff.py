@@ -554,10 +554,13 @@ class OptionSimulator:
         prices: pd.Series,
         dvol: Optional[pd.Series],
     ) -> Optional[pd.Series]:
-        """Reindex *dvol* to *prices* index; return None if dvol is None."""
+        """Reindex dvol to prices index; forward-fill weekend/holiday gaps (≤3 days)."""
         if dvol is None:
             return None
-        return dvol.reindex(prices.index)
+        full_start = min(dvol.index.min(), prices.index.min())
+        full_end = max(dvol.index.max(), prices.index.max())
+        full_idx = pd.date_range(full_start, full_end, freq="D")
+        return dvol.reindex(full_idx).ffill(limit=3).reindex(prices.index)
 
     def _nan_series(self, index: pd.DatetimeIndex, name: str) -> pd.Series:
         """Return an all-NaN series (used when dvol is None)."""
