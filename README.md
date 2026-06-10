@@ -608,6 +608,11 @@ WalkForwardResult  ── OOS PnL, Sharpe, Calmar, leakage test, trial ledger
 | Forward-filtered decode | Causal — no look-ahead bias |
 | Hysteresis gate (prob ≥ 0.70, 3 bars) | Prevents fee bleed from state chatter |
 | Black-76 option pricing | Forward model; Deribit DVOL as IV for realistic PnL |
+| Costs charged at strategy switches only | Perpetual positions are held open, not rolled daily |
+| Vol-targeting (40% ann., 2× cap) | Normalises risk across heterogeneous strategies |
+| VRP-gated short vol | Short straddles only fire when implied > realised vol |
+| Newey-West HAC Sharpe t-stat | Daily OOS PnL is serially correlated; naive t-stat overstates significance |
+| Single-asset HMM (`hmm_instrument`) | Fit on BTC features alone rather than a BTC/ETH blend |
 
 ## Installation
 
@@ -623,37 +628,47 @@ the standard Qlib dependencies.
 ### 1. Download data
 
 ```bash
-# OHLCV — Binance spot
-python scripts/data_collector/crypto_binance/collector.py \
-    --symbols BTCUSDT ETHUSDT \
-    --start_date 2019-01-01
-
-# Funding rates (perp strategies)
-python scripts/data_collector/crypto_binance/funding_collector.py \
-    --symbols BTCUSDT ETHUSDT \
-    --start_date 2019-09-01
-
-# Deribit DVOL (option strategies — from 2021-07 only)
-python scripts/data_collector/crypto_deribit/dvol_collector.py \
-    --currencies BTC ETH \
-    --start_date 2021-07-01
+python examples/regime_classifier/crypto_workflow.py download_data
 ```
 
-### 2. Run the full walk-forward backtest
+This fetches Binance OHLCV (from 2018), Binance perpetual funding rates
+(from 2019-09), and Deribit DVOL (from 2021-03) in one step.
+
+### 2. Validate the downloaded data
 
 ```bash
-python examples/regime_classifier/crypto_workflow.py run \
-    --instruments BTCUSDT ETHUSDT \
-    --data_dir ~/.qlib/qlib_data/crypto_binance
+python examples/regime_classifier/crypto_workflow.py validate_data
 ```
 
-### 3. Run on the sealed holdout (2024-Q4 onward — only once!)
+Checks for calendar gaps, stale/zero prices, funding NaN rates, and
+out-of-range DVOL values before any modelling begins.
+
+### 3. Run the full walk-forward backtest
 
 ```bash
-python examples/regime_classifier/crypto_workflow.py holdout \
-    --instruments BTCUSDT ETHUSDT \
-    --data_dir ~/.qlib/qlib_data/crypto_binance
+python examples/regime_classifier/crypto_workflow.py run
 ```
+
+Rolls W1=18mo fit / W2=6mo select / W3=3mo OOS quarterly across the research
+period and reports aggregate OOS Sharpe (HAC-corrected t-stat), Calmar, max
+drawdown, and hit rate against buy-and-hold / funding-carry / vol-target
+baselines.
+
+### 4. Run on the sealed holdout (2024-Q4 onward — only once!)
+
+```bash
+python examples/regime_classifier/crypto_workflow.py holdout
+```
+
+## Strategy Library
+
+| Strategy | Instrument | Active period |
+|---|---|---|
+| `LongPerp` / `ShortPerp` | Perpetual futures | 2019-09 → |
+| `FundingCarry` | Delta-hedged perp | 2019-09 → |
+| `ShortStraddle` / `IronCondor` / `BullPutSpread` | Weekly options (Black-76, DVOL IV) | 2021-07 → |
+| `VRPShortStraddle` | Short straddle gated on Variance Risk Premium > 0 | 2021-07 → |
+| `Flat` | No position | always |
 
 ## Module Reference
 
@@ -662,13 +677,20 @@ python examples/regime_classifier/crypto_workflow.py holdout \
 | `qlib/contrib/data/handler_regime.py` | `RegimeDataHandler` — 18 stationary OHLCV features |
 | `qlib/contrib/model/hmm_regime.py` | `HMMRegimeModel` — GaussianHMM with BIC, hysteresis |
 | `qlib/contrib/model/hmm_label_aligner.py` | `HMMLabelAligner` — Hungarian alignment across refits |
-| `qlib/contrib/strategy/crypto_payoff.py` | `PerpSimulator`, `OptionSimulator` — daily PnL series |
+| `qlib/contrib/strategy/crypto_payoff.py` | `PerpSimulator`, `OptionSimulator`, `compute_vrp` — daily PnL series |
 | `qlib/contrib/strategy/state_strategy_selector.py` | `StateStrategySelector` — hardened regime→strategy mapping |
 | `qlib/contrib/strategy/regime_gated.py` | `RegimeGatedStrategy` — runtime risk-degree gating |
-| `qlib/contrib/workflow/regime_walkforward.py` | `RegimeWalkForward` — W1/W2/W3 rolling protocol |
-| `examples/regime_classifier/crypto_workflow.py` | End-to-end CLI |
+| `qlib/contrib/workflow/regime_walkforward.py` | `RegimeWalkForward` — W1/W2/W3 rolling protocol, vol-targeting, HAC stats |
+| `examples/regime_classifier/crypto_workflow.py` | End-to-end CLI (`download_data` / `validate_data` / `predict_only` / `run` / `holdout`) |
 | `scripts/data_collector/crypto_binance/` | Binance OHLCV + funding collectors |
 | `scripts/data_collector/crypto_deribit/` | Deribit DVOL collector |
+| `tests/test_regime_classifier.py` | 106 unit + integration tests |
+
+## Statistical Safeguards
+
+- **Leakage check** — `leakage_check()` re-runs the protocol with features shifted +1 day; if the future-injected run wins ≥75% of windows, a `LeakageWarning` is raised.
+- **Multiple-testing ledger** — every `run()` appends to `~/.qlib/regime_trials.csv` and reports a Bonferroni-corrected p-value across all trials.
+- **Sealed holdout** — the final 2024-Q4+ slice is evaluated exactly once, after all hyperparameters are frozen.
 
 ## Project Plan
 

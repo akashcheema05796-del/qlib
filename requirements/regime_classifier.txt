@@ -15,7 +15,8 @@ lightgbm>=4.0.0
 # Scikit-learn preprocessing (PowerTransformer, StandardScaler)
 scikit-learn>=1.3.0
 
-# Hungarian label alignment, Black-76 option pricing
+# Hungarian label alignment, Black-76 option pricing,
+# t-distribution for Bonferroni-corrected p-values
 scipy>=1.11.0
 
 # Data manipulation
@@ -33,3 +34,7 @@ python-dateutil>=2.8.0
 
 # Optional: interactive plots from WalkForwardResult.plot_oos_pnl()
 matplotlib>=3.7.0
+
+# Optional (dev): run the test suite
+#   python -m pytest tests/test_regime_classifier.py
+pytest>=7.0.0
